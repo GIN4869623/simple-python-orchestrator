@@ -1,200 +1,136 @@
 # Simple Python Orchestrator
 
-这是一个用于学习的最小 LLM 编排智能体骨架。
+这是一个用于学习 LangGraph 的多智能体主编排器。主图负责任务规划、动态分发、
+依赖检查、批次 Review、重试与重规划；Knowledge、DeviceManager、USRP 作为独立
+专业智能体，通过 Port/Adapter 与主图隔离。
 
-当前版本先分析业务意图，再由本地 Ollama 模型生成结构化计划并交给编排器执行。
-能力注册表相关代码暂时保留，但默认不参与规划：
+当前专业智能体仍是本地 Fake，不会操作真实硬件。将来它们部署到不同设备时，
+可用静态配置的 HTTP + JSON-RPC 2.0 Adapter 替换 Fake。远程智能体可在各自服务
+内部使用自己的 LangGraph 和私有 State；它们不是嵌在主图进程里的子图。
 
-```text
-用户请求
-  → OllamaPlanner.analyze_intent()
-  → OllamaPlanner.create_plan()
-  → Orchestrator 按依赖执行任务
-  → Knowledge / DeviceManager / USRP Port
-  → OllamaPlanner.review() 评估每个返回
-  → 继续 / 重试 / 重规划 / 成功 / 停止
-  → Orchestrator 汇总结果
-```
-
-其中：
-
-- Planner 使用 Ollama `/api/chat` 接口分别生成结构化意图和动态任务计划。
-- 能力注册表与严格计划校验暂时默认关闭；USRP 任务可直接交给 `usrp`，不再强制插入 `device.select` 或引用 `device_id`。
-- 如需恢复旧的能力匹配和前置条件校验，可使用 `--enable-agent-registry` 或设置 `ORCHESTRATOR_ENABLE_AGENT_REGISTRY=1`。
-- 每个后端返回 `AgentResult` 后，LLM 使用结构化决策判断下一步。
-- `FixedPlanner` 仍用于离线运行和单元测试。
-- 知识智能体只保留一个 `KnowledgeAgentPort.invoke()` 接口。
-- 设备管理智能体查询设备信息、状态与能力，并为 USRP 任务选择可用设备，只保留一个 `DeviceManagerPort.invoke()` 接口。
-- USRP 硬件智能体只执行真实 USRP 配置、发射、接收、停止和状态查询；软件仿真及非 USRP 硬件不会启用它。
-- 三个依赖使用 Fake 运行，因此无需模型、数据库或真实硬件即可阅读和运行。
-- 当前 Fake 环境默认采用 `demo_defaults`：允许模糊 USRP 请求，并明确记录由 Fake 默认补全的参数。接入真实硬件时应切换为 `strict`。
-
-## 现在没有什么
-
-第一版故意不加入：
-
-- LangGraph
-- MCP / A2A
-- 并发
-- checkpoint 和数据库
-- RAG 与各专业智能体内部实现
-- 真实 USRP 操作
-
-这些功能只有在当前固定闭环通过测试后，才按需增加。
-
-## 项目结构
+下面仅是 **USRP 物理操作** 的路径，不代表每次请求都会经过这些节点：
 
 ```text
-simple-python-orchestrator/
-├── README.md
-├── pyproject.toml
-├── docs/
-│   └── 开发总路线.md
-├── src/simple_orchestrator/
-│   ├── __init__.py
-│   ├── models.py          # 先写：数据和状态
-│   ├── agent_registry.py  # 智能体能力注册表
-│   ├── validation.py      # 计划业务边界校验
-│   ├── ports.py           # 再写：三个外部接口
-│   ├── fakes.py           # 固定响应的测试实现
-│   ├── planner.py         # FixedPlanner 与 OllamaPlanner
-│   ├── orchestrator.py    # 编排主循环
-│   └── main.py            # 命令行入口
-└── tests/
-    └── test_orchestrator.py
+物理操作请求
+  → analyze_intent
+  → create_plan
+  → dispatch（按依赖动态 Send）
+      ├─ Knowledge：检索可信 Skill ID ─┐
+      └─ DeviceManager：选择可用设备 ───┴→ review_batch
+                                           → USRP（条件进入）
+                                           → review_batch → 完成/重试/重规划/停止
 ```
 
-详细编写顺序见 [`docs/开发总路线.md`](docs/开发总路线.md)。
+对于 USRP 物理任务，主图强制要求 Knowledge 与 DeviceManager 前置任务。
+两个前置任务可并行；没有可用设备时直接停止。Knowledge 只返回可信 Markdown
+Skill 的 ID、版本和摘要。USRP 智能体自行二次读取并校验正文；读取或验证失败时
+不得执行物理操作。当前 Fake 模拟这条调用链。
 
-## 使用 Ollama 规划
+只读请求走更短的路径：查询可用设备或设备状态时，仅调用 DeviceManager；
+USRP 专属知识可以调用 USRP 的 `knowledge.explain` 只读能力，不触发 Skill 前置任务、
+设备选择或硬件执行。通用通信知识仍可由 Knowledge 回答。Ollama 将请求识别为
+`device_query` 后，仍由 LLM 按固定 JSON Schema 填写任务字段；主图只允许单个
+DeviceManager 只读查询任务，不允许把设备查询指派给 USRP。若计划违反约束，会
+明确报规划错误，不会悄悄改写模型的任务内容。
 
-Python 代码只使用标准库，要求 Python 3.11 或更高版本。程序会自动读取项目根
-目录的 `.env`，真实的系统环境变量具有更高优先级。请先在 `.env` 中填写本地
-Ollama 配置，并确保所选模型支持结构化输出：
+## 安装与运行
 
-无需使用 pip 安装，直接运行项目启动器：
+要求 Python 3.11+。项目依赖 LangGraph：
 
 ```bash
-./run
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+./run "解释 QPSK 原理" --planner fixed --fake-outcome succeeded
 ```
 
-也可以直接把任务附在后面：
+`./run` 优先使用项目 `.venv/bin/python`。默认 Planner 为本地 Ollama；如需使用，
+参照 `.env.example` 设置 `OLLAMA_MODEL`，并确保 Ollama 服务已启动：
 
 ```bash
-./run "解释 QPSK 原理"
+./run "查询有哪些可用的 USRP 设备" --fake-outcome succeeded
 ```
+
+Fake 环境默认使用 `demo_defaults`，可演示参数不完整的 USRP 请求。真实远程硬件
+模式强制要求 `--parameter-policy strict`，缺参时会在终端继续询问用户。真实硬件
+接入前，还必须由 USRP 服务自行实现权限、安全检查和幂等执行。
 
 ```bash
-cd ~/Desktop/simple-python-orchestrator
-PYTHONPATH=src python3 -m simple_orchestrator.main "查询网络中有哪些可用设备"
+./run "使用 USRP 以中心频率 2.4GHz、采样率 1MHz、增益 10dB，发射 QPSK 信号 5 秒" \
+  --planner fixed --fake-outcome succeeded
 ```
 
-也可以先启动程序，再输入一次任务；执行完成后程序会自动退出：
+## 从启动到结束
 
-```bash
-PYTHONPATH=src python3 -m simple_orchestrator.main
-```
+1. `./run` 定位项目目录，把 `src` 加入 `PYTHONPATH`，优先用 `.venv/bin/python`，
+   否则用系统 `python3` 启动 `simple_orchestrator.main`。依赖仍须先安装到所用解释器。
+2. `main.py` 读取 `.env` 和命令行参数；若未提供请求文本，则在终端询问。默认使用
+   Ollama Planner，需配置 `OLLAMA_MODEL`；学习流程可显式传 `--planner fixed`，无需
+   启动 Ollama。未指定 `--fake-outcome` 且未启用远程模式时，会出现 Fake 结果选择菜单。
+3. 程序构建 Planner、Knowledge、DeviceManager、USRP 的 Port，然后构建
+   `GraphOrchestrator`。默认 Port 是本地 Fake。仅 `--remote-agents` 会改用静态配置的
+   JSON-RPC 地址；该模式要求三个地址齐全、参数策略为 `strict`，且不能指定
+   `--fake-outcome`。
+4. `orchestrator.run()` 为本次运行生成 `request_id`、初始化 State，并调用编译后的
+   LangGraph。`analyze_intent` 先识别意图，`create_plan` 再生成任务；需要补参或不支持
+   的请求直接到 `finalize`，不执行智能体。设备查询只能规划一个 DeviceManager 任务；
+   USRP 物理任务才会补齐 Knowledge Skill 查询与设备选择两项前置任务。
+5. `dispatch` 按依赖选出本批可执行任务，并用 `Send` 发给固定的智能体节点。
+   Knowledge 与 DeviceManager 在无相互依赖时同批并行；USRP 只读知识任务可以直接
+   进入，USRP 物理任务只在前置结果成功且通过校验后进入，且每批最多发送一个物理
+   USRP 任务。每批结果合并到 `results`，随后
+   统一经过 `review_batch → apply_review`，可能继续、只重试失败任务、重规划一次，
+   或停止。没有可用设备、明确拒绝、前置校验失败及 USRP 状态未知会直接停止。
+6. 图进入 `finalize` 后，CLI 输出意图、当前版本计划、任务状态、历次批次 Review 和
+   工作流汇总。成功退出码为 `0`，工作流未成功为 `1`，规划异常为 `2`。在 `strict`
+   模式下若需补参，CLI 会询问补充内容，并把它追加到请求后**重新运行一张新图**；
+   这不是从原图的 checkpoint 继续。
 
-```text
-请输入任务请求：如何使用 USRP 发送 QPSK 信号
-```
+例如，上面的 USRP Fake 命令会走
+`入口 → 意图分析 → 规划 → Knowledge ∥ DeviceManager → 批次 Review → USRP → 批次 Review → 汇总`。
+若没有可用设备，流程停在前置任务的批次 Review，不会进入 USRP。
 
-如果已经执行过 `python3 -m pip install -e .`，还可以使用更短的入口命令：
+## 远程接口边界
 
-```bash
-simple-orchestrator
-```
-
-终端会把 LLM 返回的结构化计划解析成中文任务分工和依赖说明，并将它与
-Fake 后端的执行结果分区显示。
-
-`.env` 可配置项：
+远程服务可用后，通过静态地址切换到同步 HTTP + JSON-RPC 2.0：
 
 ```dotenv
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=<你的本地模型名>
-OLLAMA_TIMEOUT=120
-OLLAMA_TEMPERATURE=0.2
-OLLAMA_LOG_PATH=logs/ollama_responses.json
-FAKE_DEVICE_ID=USRP-01
-ORCHESTRATOR_PARAMETER_POLICY=demo_defaults
-ORCHESTRATOR_ENABLE_AGENT_REGISTRY=0
-ORCHESTRATOR_MAX_RETRIES=1
-ORCHESTRATOR_MAX_REPLANS=1
-```
-
-仓库提供 `.env.example` 作为模板；包含本机配置的 `.env` 已被 `.gitignore` 排除。
-
-每次 Ollama 返回后，程序会更新 `OLLAMA_LOG_PATH` 指向的格式化 JSON 日志。日志
-包含 UTC 时间、模型名、对应的用户请求和 Ollama 原始响应，并自动只保留最新
-20 条。旧版 `ollama_responses.jsonl` 中的记录会在首次写入时自动迁移到新文件。
-日志中的 `phase` 用于区分 `intent_analysis`、`planning` 和执行后的 `review`。
-
-每次任务执行后，LLM 的结构化决策只能是：`continue`、`retry`、`replan`、
-`complete` 或 `stop`。整个工作流最多重新执行一次、最多重新规划一次；上面的两个
-`ORCHESTRATOR_MAX_RETRIES` 和 `ORCHESTRATOR_MAX_REPLANS` 只能设置为 `0` 或 `1`。
-
-当前三个执行后端都是 Fake，因此参数策略默认是 `demo_defaults`。例如“使用 USRP
-发送信号”会继续完成模拟执行，缺少的频率、采样率、增益、时长和波形只会由
-Fake 默认补全，不会被 Planner 编造。未来接入真实 USRP 后应配置：
-
-```dotenv
+KNOWLEDGE_RPC_URL=http://knowledge-host:8000/rpc
+DEVICE_MANAGER_RPC_URL=http://device-host:8000/rpc
+USRP_RPC_URL=http://usrp-host:8000/rpc
+ORCHESTRATOR_RPC_TIMEOUT=30
 ORCHESTRATOR_PARAMETER_POLICY=strict
 ```
 
-严格模式发现缺失参数时会在当前终端继续询问，并把用户补充内容合并到原始请求
-后重新分析。直接回车可以结束本次请求。
-
-每次运行时，终端会要求用一个序号选择本轮所有 Fake 的回复方案：
-
-```text
-1. 成功
-2. 拒绝
-3. 未知
-4. 失败
+```bash
+./run "查询有哪些可用设备" --planner fixed --remote-agents --parameter-policy strict
 ```
 
-也可以使用 `--fake-outcome succeeded|rejected|unknown|failed` 跳过选择菜单。
+只有传入 `--remote-agents` 才会调用这些地址；默认始终使用本地 Fake。实际远程
+服务及 Knowledge 的 Skill 读取接口还未在本仓库实现，接口契约可在
+`src/simple_orchestrator/remote.py` 中查看。Planner 只产生 agent ID 和能力，不得
+决定远程 URL。第一版**不放行远程 USRP 物理执行**：在真实服务具备审批、幂等和
+操作状态查询前，主图会返回拒绝结果；`--remote-agents` 当前只适合只读接口联调。
 
-也可以使用命令行参数覆盖环境变量：
+## State 与执行规则
+
+- `TaskSpec` 只记录业务任务定义；`task_statuses` 记录当前运行状态。
+- `results[task_id]` 保留该任务每次尝试的结果与错误，不覆盖旧记录。
+- `plan_history` 保存历次完整计划；调度器只执行当前版本。
+- 每个任务最多重试一次，成功任务不随失败任务重跑。
+- 整个工作流最多重规划一次。重规划保留成功任务，替换失败及未执行任务，并使用
+  新 Task ID；新任务重新获得一次重试机会。
+- USRP 返回 `UNKNOWN` 时不盲目重试，以免重复物理操作。
+- 第一版不含 checkpoint、人工中断和真实专业智能体内部实现。
+
+## 测试与阅读
 
 ```bash
-PYTHONPATH=src python3 -m simple_orchestrator.main \
-  "使用 USRP 以中心频率 2.4GHz、采样率 1MHz、增益 10dB，发射 QPSK 信号 5 秒" \
-  --ollama-url "http://localhost:11434" \
-  --ollama-model "<你的本地模型名>" \
-  --ollama-temperature "0.2" \
-  --ollama-log-path "logs/ollama_responses.json"
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
-`OLLAMA_TEMPERATURE` 可设置为 `0` 到 `2`：较低值让规划更稳定，较高值让计划
-更有变化。任务编排建议从 `0.2` 开始调整。
-
-暂时不调用 Ollama、只验证原来的固定计划：
-
-```bash
-PYTHONPATH=src python3 -m simple_orchestrator.main \
-  "解释 QPSK 原理" \
-  --planner fixed
-```
-
-不显示菜单，直接模拟拒绝回复：
-
-```bash
-PYTHONPATH=src python3 -m simple_orchestrator.main \
-  "解释 QPSK 原理" \
-  --planner fixed \
-  --fake-outcome rejected
-```
-
-## 运行测试
-
-使用标准库运行全部测试：
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-## 推荐阅读方式
-
-按照 `models.py → agent_registry.py → validation.py → ports.py → planner.py → fakes.py → orchestrator.py → main.py → tests` 的顺序阅读，并配合 `docs/开发总路线.md` 理解每个模块。
+建议按 `graph_orchestrator.py → models.py → planner.py → ports.py → fakes.py →
+remote.py → main.py → tests/test_graph_orchestrator.py` 阅读。
+`orchestrator.py` 保留旧串行实现，供迁移对照；CLI 已切换到 LangGraph 主图。
+早期开发路线在 `docs/开发总路线.md`，讨论中的架构决策在
+`docs/LangGraph迁移决策记录.md`。本次由助手代定的实现细节、代码位置和复盘问题在
+`docs/LangGraph实现默认决策与复盘清单.md`；这份清单不是你已经认可的架构决定。

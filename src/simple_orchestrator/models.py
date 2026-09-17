@@ -113,6 +113,14 @@ class ReviewDecision:
 
 
 @dataclass(frozen=True)
+class BatchReviewDecision:
+    action: NextAction
+    reason: str
+    task_ids: list[str] = field(default_factory=list)
+    revised_tasks: list[Task] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AgentResult:
     status: ResultStatus
     summary: str

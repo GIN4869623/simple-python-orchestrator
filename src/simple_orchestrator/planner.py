@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from .agent_registry import AgentRegistry, build_default_registry
 from .models import (
     AgentResult,
+    BatchReviewDecision,
     ExecutionMode,
     IntentAnalysis,
     IntentType,
@@ -140,6 +141,18 @@ REVIEW_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+BATCH_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": [action.value for action in NextAction]},
+        "reason": {"type": "string"},
+        "retry_task_ids": {"type": "array", "items": {"type": "string"}},
+        "revised_tasks": {"type": "array", "items": TASK_SCHEMA},
+    },
+    "required": ["action", "reason", "retry_task_ids", "revised_tasks"],
+    "additionalProperties": False,
+}
+
 INTENT_INSTRUCTIONS = """你是业务请求意图分析器，只描述用户想做什么，不选择智能体，也不生成任务。
 
 分类定义：
@@ -150,6 +163,10 @@ INTENT_INSTRUCTIONS = """你是业务请求意图分析器，只描述用户想�
 
 识别规则：
 1. “如何使用 USRP”“解释 USRP”“仿真 QPSK”属于 knowledge_query，不是硬件执行。
+   USRP 专属知识可由 USRP 智能体以只读方式回答，但不能因此执行硬件操作。
+   通用通信知识仍可交给 Knowledge。
+   查询可用 USRP 设备、设备清单或在线状态属于 device_query，能力使用
+   device.list 或 device.inspect，不要使用 usrp.get_status。
 2. 只有用户明确要求真实配置、发射、接收、停止等操作时，execution_mode 才能是 physical。
 3. USRP 真实操作的 target_type 必须是 usrp。
 4. RIS、频谱仪、信号源和其他非 USRP 硬件的真实操作属于 unsupported。
@@ -169,7 +186,9 @@ PLANNER_INSTRUCTIONS = """你是多智能体任务规划器。上游已经完成
 3. description 必须描述本任务的具体对象、动作和边界。
 4. inputs 必须写出执行所需输入；来自前置任务的数据使用“任务ID.字段名”表示。
 5. expected_output 和 completion_criteria 必须具体、可检查。
-6. USRP 操作可以直接交给 usrp 智能体，不要求先调用 device.select，也不要求提供或引用 device_id。只有用户明确要求查询或选择设备时，才安排 device_manager。
+6. device_query 只安排一个 device_manager 任务，不安排 knowledge 或 usrp。
+   USRP 专属知识请求可以安排 usrp 的 knowledge.explain 只读任务，不得安排物理操作。
+   真实 USRP 物理操作交给 usrp；主图会补齐所需前置任务。
 7. knowledge 不得查询实时设备；device_manager 不得审批法规或执行射频操作；usrp 不得执行 RIS、软件仿真或通用硬件任务。
 8. 计划必须覆盖 intent_analysis.required_capabilities 中的全部能力。
 9. 当 provided_parameters.parameter_policy 为 use_backend_defaults 时，将 unresolved_parameters 原样传给硬件任务，由 Fake 或后端补全；不得自行编造参数。
@@ -187,7 +206,7 @@ REVIEW_INSTRUCTIONS = """你是工作流执行评估器。根据用户目标、�
 2. retry 只能原样重试当前任务。
 3. replan 必须给出完整的新后续计划，且只能使用 available_agents 中的智能体。
 4. 非 replan 动作的 revised_tasks 必须为空。
-5. USRP 任务必须满足真实 USRP 操作意图，但默认不要求 device.select 或 device_id。
+5. USRP 物理任务必须满足真实硬件操作意图；USRP 的 knowledge.explain 是只读知识任务。
 6. retry 或 replan 的 remaining 为 0 时不得再次选择对应动作。
 7. reason 简短且可检查，不输出长篇思考过程。
 """
@@ -205,12 +224,21 @@ class FixedPlanner:
     parameter_policy: ParameterPolicy = ParameterPolicy.STRICT
     enable_agent_registry: bool = False
 
-    def create_plan(self, user_request: str) -> TaskPlan:
+    def analyze_intent(self, user_request: str) -> IntentAnalysis:
         intent = _analyze_intent_with_rules(user_request)
         if intent.intent_type is IntentType.UNSUPPORTED:
-            return TaskPlan(PlanStatus.UNSUPPORTED, intent, reason=intent.reason)
+            return intent
         intent = _apply_registry_device_policy(intent, self.enable_agent_registry)
-        intent = _apply_parameter_policy(intent, self.parameter_policy)
+        return _apply_parameter_policy(intent, self.parameter_policy)
+
+    def create_plan(self, user_request: str) -> TaskPlan:
+        return self.create_plan_from_intent(user_request, self.analyze_intent(user_request))
+
+    def create_plan_from_intent(
+        self, user_request: str, intent: IntentAnalysis
+    ) -> TaskPlan:
+        if intent.intent_type is IntentType.UNSUPPORTED:
+            return TaskPlan(PlanStatus.UNSUPPORTED, intent, reason=intent.reason)
         if intent.needs_clarification:
             return TaskPlan(
                 PlanStatus.NEEDS_CLARIFICATION,
@@ -248,6 +276,56 @@ class FixedPlanner:
             reason = f"固定规划器在任务失败后停止：{result.summary}"
         return ReviewDecision(current_task.task_id, action, reason)
 
+    def review_batch(self, context: dict[str, Any]) -> BatchReviewDecision:
+        retryable = context["retryable_task_ids"]
+        failed = context["failed_task_ids"]
+        if failed:
+            if retryable:
+                return BatchReviewDecision(
+                    NextAction.RETRY, "仅重试本批次失败且尚有机会的任务", retryable
+                )
+            if context["can_replan"] and all(
+                context["batch_results"][task_id]["status"] == "failed"
+                for task_id in failed
+            ):
+                successful = set(context["successful_task_ids"])
+                replaced = [
+                    task for task in context["current_plan"]
+                    if task["task_id"] not in successful
+                ]
+                used = set(context["known_task_ids"])
+                renamed: dict[str, str] = {}
+                for task in replaced:
+                    base = f"{task['task_id']}_replan"
+                    candidate = base
+                    suffix = 2
+                    while candidate in used:
+                        candidate = f"{base}_{suffix}"
+                        suffix += 1
+                    used.add(candidate)
+                    renamed[task["task_id"]] = candidate
+                revised = [
+                    Task(
+                        task_id=renamed[task["task_id"]],
+                        agent=task["agent"],
+                        description=task["description"],
+                        dependencies=[renamed.get(dep, dep) for dep in task["dependencies"]],
+                        capability=task["capability"],
+                        inputs=dict(task["inputs"]),
+                        expected_output=list(task["expected_output"]),
+                        completion_criteria=list(task["completion_criteria"]),
+                    )
+                    for task in replaced
+                ]
+                return BatchReviewDecision(
+                    NextAction.REPLAN,
+                    "固定规划器重建失败任务与未执行的下游任务",
+                    revised_tasks=revised,
+                )
+            return BatchReviewDecision(NextAction.STOP, "任务失败且无法继续重试")
+        action = NextAction.CONTINUE if context["has_pending_tasks"] else NextAction.COMPLETE
+        return BatchReviewDecision(action, "本批次任务成功")
+
 
 @dataclass
 class OllamaPlanner:
@@ -276,10 +354,28 @@ class OllamaPlanner:
             phase="intent_analysis",
         )
         data = self._response_content_as_json(response_body, "结构化意图分析")
-        return _parse_intent_analysis(data)
+        intent = _parse_intent_analysis(data)
+        if intent.intent_type is IntentType.DEVICE_QUERY:
+            capability = (
+                "device.inspect"
+                if "状态" in user_request or "inspect" in intent.action.lower()
+                else "device.list"
+            )
+            intent = replace(
+                intent,
+                execution_mode=ExecutionMode.READ_ONLY,
+                required_capabilities=[capability],
+                missing_parameters=[],
+                needs_clarification=False,
+            )
+        return intent
 
     def create_plan(self, user_request: str) -> TaskPlan:
-        intent = self.analyze_intent(user_request)
+        return self.create_plan_from_intent(user_request, self.analyze_intent(user_request))
+
+    def create_plan_from_intent(
+        self, user_request: str, intent: IntentAnalysis
+    ) -> TaskPlan:
         if intent.intent_type is IntentType.UNSUPPORTED:
             return TaskPlan(PlanStatus.UNSUPPORTED, intent, reason=intent.reason)
         if (
@@ -317,6 +413,8 @@ class OllamaPlanner:
             available_agents = [
                 profile.as_prompt_dict() for profile in candidates
             ]
+        elif intent.intent_type is IntentType.DEVICE_QUERY:
+            available_agents = ["device_manager"]
         else:
             available_agents = ["knowledge", "device_manager", "usrp"]
 
@@ -425,6 +523,81 @@ class OllamaPlanner:
                 except PlanValidationError as exc:
                     raise PlanningError(str(exc)) from exc
         return decision
+
+    def review_batch(self, context: dict[str, Any]) -> BatchReviewDecision:
+        response = self._chat(
+            instructions=(
+                "你是工作流批次评审器。一次评估本批全部结果。成功且有后续任务时 "
+                "continue，全部完成时 complete。retry_task_ids 只能包含给定的 "
+                "retryable_task_ids。只有 action=replan 且 can_replan=true 时，"
+                "revised_tasks 才能填写完整的新后续任务；action 为 continue、retry、"
+                "complete 或 stop 时，revised_tasks 必须是空数组 []，不得复制当前计划"
+                "或待执行任务。不得放行失败的前置条件。只返回 JSON。"
+            ),
+            user_content=(
+                "请评估批次状态：\n"
+                f"{json.dumps(context, ensure_ascii=False, default=str)}\n"
+                "输出符合以下 JSON Schema：\n"
+                f"{json.dumps(BATCH_REVIEW_SCHEMA, ensure_ascii=False)}"
+            ),
+            schema=BATCH_REVIEW_SCHEMA,
+            user_request=context["user_request"],
+            phase="batch_review",
+        )
+        data = self._response_content_as_json(response, "批次评审决策")
+        if not isinstance(data, dict):
+            raise PlanningError("批次评审必须返回对象")
+        try:
+            action = NextAction(data.get("action"))
+        except (ValueError, TypeError) as exc:
+            raise PlanningError("批次评审返回未知 action") from exc
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise PlanningError("批次评审缺少 reason")
+        retry_ids = _string_list(data.get("retry_task_ids"), "retry_task_ids")
+        if not set(retry_ids).issubset(context["retryable_task_ids"]):
+            raise PlanningError("批次评审要求重试不可重试的任务")
+        if action is NextAction.RETRY and not retry_ids:
+            raise PlanningError("retry 决策没有任务 ID")
+        if action is not NextAction.RETRY and retry_ids:
+            raise PlanningError("非 retry 决策不应包含 retry_task_ids")
+        raw_revised = data.get("revised_tasks")
+        if not isinstance(raw_revised, list):
+            raise PlanningError("批次评审缺少 revised_tasks")
+        revised: list[Task] = []
+        if action is NextAction.REPLAN:
+            if not context["can_replan"]:
+                raise PlanningError("已达到重规划上限")
+            revised = _parse_tasks(
+                {"tasks": raw_revised},
+                reserved_task_ids=set(context["known_task_ids"]),
+                available_dependency_ids=set(context["successful_task_ids"]),
+            )
+            intent = _parse_intent_analysis(context["intent_analysis"])
+            _apply_code_owned_task_inputs(intent, revised)
+            if self.enable_agent_registry:
+                prior_tasks = [
+                    Task(
+                        task_id=task["task_id"],
+                        agent=task["agent"],
+                        description=task["description"],
+                        dependencies=list(task["dependencies"]),
+                        capability=task["capability"],
+                        inputs=task["inputs"],
+                    )
+                    for task in context["current_plan"]
+                    if task["task_id"] in context["successful_task_ids"]
+                ]
+                try:
+                    PlanValidator(self.registry).validate(
+                        intent, revised, self.registry.match(intent),
+                        prior_tasks=prior_tasks,
+                    )
+                except PlanValidationError as exc:
+                    raise PlanningError(str(exc)) from exc
+        elif raw_revised:
+            raise PlanningError("非 replan 决策不应包含 revised_tasks")
+        return BatchReviewDecision(action, reason, retry_ids, revised)
 
     def _chat(
         self,

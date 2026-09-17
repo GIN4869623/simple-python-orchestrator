@@ -8,6 +8,7 @@ import sys
 
 from .config import load_dotenv
 from .fakes import FakeDeviceManagerPort, FakeKnowledgePort, FakeUsrpAgent
+from .graph_orchestrator import GraphOrchestrator
 from .models import (
     IntentAnalysis,
     NextAction,
@@ -17,8 +18,8 @@ from .models import (
     TaskStatus,
     WorkflowStatus,
 )
-from .orchestrator import Orchestrator
 from .planner import FixedPlanner, OllamaPlanner, PlanningError
+from .remote import JsonRpcAgentAdapter
 
 
 AGENT_NAMES = {
@@ -144,6 +145,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过交互菜单，直接指定所有 Fake 的回复方案",
     )
     parser.add_argument(
+        "--remote-agents",
+        action="store_true",
+        help="通过静态配置的 HTTP + JSON-RPC 地址调用远程智能体",
+    )
+    parser.add_argument("--knowledge-rpc-url", default=os.getenv("KNOWLEDGE_RPC_URL", ""))
+    parser.add_argument("--device-rpc-url", default=os.getenv("DEVICE_MANAGER_RPC_URL", ""))
+    parser.add_argument("--usrp-rpc-url", default=os.getenv("USRP_RPC_URL", ""))
+    parser.add_argument(
+        "--rpc-timeout", type=float,
+        default=float(os.getenv("ORCHESTRATOR_RPC_TIMEOUT", "30")),
+    )
+    parser.add_argument(
         "--device-id",
         default=os.getenv("FAKE_DEVICE_ID", "USRP-01"),
         help="Fake 选中的设备 ID",
@@ -177,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=[0, 1],
         default=int(os.getenv("ORCHESTRATOR_MAX_RETRIES", "1")),
-        help="整个工作流最多重新执行次数，只能为 0 或 1",
+        help="每个任务在每版计划中最多重试次数，只能为 0 或 1",
     )
     parser.add_argument(
         "--max-replans",
@@ -223,7 +236,35 @@ def main() -> int:
         if not user_request:
             parser.error("任务请求不能为空")
 
-    fake_outcome = choose_fake_outcome(args.fake_outcome)
+    if args.remote_agents:
+        if args.parameter_policy != ParameterPolicy.STRICT.value:
+            parser.error("远程硬件模式必须使用 --parameter-policy strict")
+        if args.fake_outcome is not None:
+            parser.error("远程智能体模式不能同时指定 --fake-outcome")
+        if not all((args.knowledge_rpc_url, args.device_rpc_url, args.usrp_rpc_url)):
+            parser.error("远程智能体模式必须配置 Knowledge、DeviceManager 和 USRP 地址")
+        fake_outcome = None
+        token = os.getenv("ORCHESTRATOR_RPC_TOKEN")
+        knowledge = JsonRpcAgentAdapter(
+            args.knowledge_rpc_url, "knowledge", timeout=args.rpc_timeout,
+            auth_token=token,
+        )
+        device_manager = JsonRpcAgentAdapter(
+            args.device_rpc_url, "device_manager", timeout=args.rpc_timeout,
+            auth_token=token,
+        )
+        usrp = JsonRpcAgentAdapter(
+            args.usrp_rpc_url, "usrp", timeout=args.rpc_timeout,
+            auth_token=token,
+        )
+    else:
+        fake_outcome = choose_fake_outcome(args.fake_outcome)
+        knowledge = FakeKnowledgePort(outcome=fake_outcome)
+        device_manager = FakeDeviceManagerPort(
+            device_id=args.device_id,
+            outcome=fake_outcome,
+        )
+        usrp = FakeUsrpAgent(outcome=fake_outcome)
     parameter_policy = ParameterPolicy(args.parameter_policy)
 
     if args.planner == "ollama":
@@ -246,24 +287,21 @@ def main() -> int:
             enable_agent_registry=args.enable_agent_registry,
         )
 
-    orchestrator = Orchestrator(
+    orchestrator = GraphOrchestrator(
         planner=planner,
-        knowledge=FakeKnowledgePort(outcome=fake_outcome),
-        device_manager=FakeDeviceManagerPort(
-            device_id=args.device_id,
-            outcome=fake_outcome,
-        ),
-        usrp=FakeUsrpAgent(outcome=fake_outcome),
+        knowledge=knowledge,
+        device_manager=device_manager,
+        usrp=usrp,
         max_retries=args.max_retries,
         max_replans=args.max_replans,
     )
     try:
         state = orchestrator.run(user_request)
         while (
-            state.status is WorkflowStatus.NEEDS_CLARIFICATION
+            state["status"] is WorkflowStatus.NEEDS_CLARIFICATION
             and parameter_policy is ParameterPolicy.STRICT
         ):
-            print(state.final_answer)
+            print(state["final_answer"])
             try:
                 supplement = input(
                     "请补充上述参数（直接回车结束本次请求）："
@@ -279,23 +317,27 @@ def main() -> int:
         return 2
 
     planner_name = "LLM " if args.planner == "ollama" else "FixedPlanner "
-    if state.intent is not None:
-        print(describe_intent(state.intent))
-    print(describe_plan(state.tasks, planner_name))
-    print(
-        "\n执行结果（当前后端为 Fake，"
-        f"本次方案：{FAKE_OUTCOME_NAMES[fake_outcome]}）："
-    )
-    for index, task in enumerate(state.tasks, start=1):
+    if state.get("intent") is not None:
+        print(describe_intent(state["intent"]))
+    tasks = list(state["plan_history"][-1].tasks) if state["plan_history"] else []
+    print(describe_plan(tasks, planner_name))
+    if fake_outcome is None:
+        print("\n执行结果（当前后端为远程 JSON-RPC 智能体）：")
+    else:
+        print(
+            "\n执行结果（当前后端为 Fake，"
+            f"本次方案：{FAKE_OUTCOME_NAMES[fake_outcome]}）："
+        )
+    for index, task in enumerate(tasks, start=1):
         agent_name = AGENT_NAMES.get(task.agent, task.agent)
-        status_name = TASK_STATUS_NAMES[task.status]
+        status_name = TASK_STATUS_NAMES[state["task_statuses"][task.task_id]]
         print(f"{index}. {agent_name}：{status_name}")
     print("\n规划器执行判断：")
-    for index, review in enumerate(state.reviews, start=1):
+    for index, review in enumerate(state["reviews"], start=1):
         action_name = ACTION_NAMES[review.action]
-        print(f"{index}. 任务 {review.task_id}：{action_name}——{review.reason}")
-    print(f"\n工作流汇总：{state.final_answer}")
-    return 0 if state.status is WorkflowStatus.SUCCEEDED else 1
+        print(f"{index}. 第 {index} 批：{action_name}——{review.reason}")
+    print(f"\n工作流汇总：{state['final_answer']}")
+    return 0 if state["status"] is WorkflowStatus.SUCCEEDED else 1
 
 
 if __name__ == "__main__":

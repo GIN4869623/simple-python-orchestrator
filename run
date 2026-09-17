@@ -3,4 +3,7 @@ set -euo pipefail
 
 PROJECT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${PROJECT_DIRECTORY}/src${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -x "${PROJECT_DIRECTORY}/.venv/bin/python" ]]; then
+  exec "${PROJECT_DIRECTORY}/.venv/bin/python" -m simple_orchestrator.main "$@"
+fi
 exec python3 -m simple_orchestrator.main "$@"

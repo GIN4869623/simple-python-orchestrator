@@ -61,6 +61,14 @@ class PlanValidator:
         task: Task,
         tasks_by_id: dict[str, Task],
     ) -> None:
+        if task.capability == "knowledge.explain":
+            if (
+                intent.intent_type is not IntentType.KNOWLEDGE_QUERY
+                or intent.target_type != "usrp"
+                or intent.execution_mode is not ExecutionMode.INFORMATIONAL
+            ):
+                raise PlanValidationError("USRP 知识查询只允许用于只读 USRP 知识意图")
+            return
         if intent.intent_type is not IntentType.HARDWARE_EXECUTION:
             raise PlanValidationError("只有真实硬件执行意图可以启用 USRP 智能体")
         if intent.target_type != "usrp":

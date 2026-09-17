@@ -82,6 +82,78 @@ class OllamaPlannerTests(unittest.TestCase):
         return response
 
     @patch("simple_orchestrator.planner.urlopen")
+    def test_batch_review_non_replan_requests_empty_revised_tasks(
+        self, urlopen: MagicMock
+    ) -> None:
+        urlopen.return_value = self._ollama_response({
+            "action": "continue",
+            "reason": "前置任务成功，继续执行现有计划",
+            "retry_task_ids": [],
+            "revised_tasks": [],
+        })
+
+        decision = OllamaPlanner(model="local-model").review_batch({
+            "user_request": "使用 USRP 发射信号",
+            "retryable_task_ids": [],
+        })
+
+        self.assertIs(NextAction.CONTINUE, decision.action)
+        self.assertEqual([], decision.revised_tasks)
+        request_body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        instructions = request_body["messages"][0]["content"]
+        self.assertIn("revised_tasks 必须是空数组 []", instructions)
+        self.assertIn("不得复制当前计划或待执行任务", instructions)
+
+    @patch("simple_orchestrator.planner.urlopen")
+    def test_batch_review_still_rejects_non_replan_with_revised_tasks(
+        self, urlopen: MagicMock
+    ) -> None:
+        urlopen.return_value = self._ollama_response({
+            "action": "continue",
+            "reason": "继续执行现有计划",
+            "retry_task_ids": [],
+            "revised_tasks": [task_data("T1", "usrp", "usrp.transmit", [])],
+        })
+
+        with self.assertRaisesRegex(PlanningError, "非 replan 决策不应包含 revised_tasks"):
+            OllamaPlanner(model="local-model").review_batch({
+                "user_request": "使用 USRP 发射信号",
+                "retryable_task_ids": [],
+            })
+
+    @patch("simple_orchestrator.planner.urlopen")
+    def test_registry_accepts_usrp_read_only_knowledge_task(
+        self, urlopen: MagicMock
+    ) -> None:
+        intent = {
+            "intent_type": "knowledge_query",
+            "domain": "wireless_communication",
+            "target_type": "usrp",
+            "action": "explain",
+            "execution_mode": "informational",
+            "required_capabilities": ["knowledge.explain"],
+            "provided_parameters": {},
+            "missing_parameters": [],
+            "needs_clarification": False,
+            "evidence": "如何使用 USRP",
+            "reason": "只询问操作知识",
+        }
+        urlopen.side_effect = [
+            self._ollama_response(intent),
+            self._ollama_response({"tasks": [task_data(
+                "usrp_knowledge", "usrp", "knowledge.explain", [],
+            )]}),
+        ]
+
+        plan = OllamaPlanner(
+            model="local-model", enable_agent_registry=True,
+        ).create_plan("如何使用 USRP")
+
+        self.assertIs(PlanStatus.READY, plan.status)
+        self.assertEqual("usrp", plan.tasks[0].agent)
+        self.assertEqual("knowledge.explain", plan.tasks[0].capability)
+
+    @patch("simple_orchestrator.planner.urlopen")
     def test_analyzes_intent_then_plans_with_registry_candidates(
         self, urlopen: MagicMock
     ) -> None:
