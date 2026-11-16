@@ -29,11 +29,13 @@ class PlannerPort(Protocol):
         """Choose what the workflow should do after one task result."""
 
 
-class GraphPlannerPort(Protocol):
-    """Main graph contract: separate analysis/planning and batch review."""
-
+class IntentAgentPort(Protocol):
     def analyze_intent(self, user_request: str) -> IntentAnalysis:
-        """Classify one user request before planning."""
+        """Understand one request and suggest a handling mode; never execute it."""
+
+
+class GraphPlannerPort(Protocol):
+    """Dynamic planning and review, independent of intent recognition."""
 
     def create_plan_from_intent(
         self, user_request: str, intent: IntentAnalysis
@@ -45,13 +47,17 @@ class GraphPlannerPort(Protocol):
 
 
 class KnowledgeAgentPort(Protocol):
-    def invoke(self, request: Mapping[str, Any]) -> AgentResult:
-        """Call the single external knowledge-agent interface."""
+    def invoke(
+        self, request: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None,
+    ) -> AgentResult:
+        """Receive only a natural-language message; metadata is out of band."""
 
 
 class DeviceManagerPort(Protocol):
-    def invoke(self, request: Mapping[str, Any]) -> AgentResult:
-        """Report network device information and select an available device."""
+    def invoke(
+        self, request: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None,
+    ) -> AgentResult:
+        """Only query network device information and status; never operate devices."""
 
 
 class UsrpAgentPort(Protocol):

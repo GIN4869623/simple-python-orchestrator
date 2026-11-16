@@ -20,8 +20,8 @@ from simple_orchestrator.models import (
     TaskStatus,
     WorkflowStatus,
 )
-from simple_orchestrator.orchestrator import Orchestrator
-from simple_orchestrator.planner import FixedPlanner
+from simple_orchestrator.orchestration.serial import Orchestrator
+from simple_orchestrator.orchestration.planner import FixedPlanner
 
 
 def knowledge_intent() -> IntentAnalysis:
@@ -69,7 +69,7 @@ class OrchestratorTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.call_count = 0
 
-            def invoke(self, request) -> AgentResult:
+            def invoke(self, request, *, metadata=None) -> AgentResult:
                 self.call_count += 1
                 if self.call_count == 1:
                     return AgentResult(ResultStatus.FAILED, "第一次查询失败")
@@ -170,7 +170,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_complete_usrp_request_runs_usrp_directly_by_default(self) -> None:
         knowledge = FakeKnowledgePort()
-        device_manager = FakeDeviceManagerPort(selection="selected")
+        device_manager = FakeDeviceManagerPort()
         usrp = FakeUsrpAgent()
 
         state = Orchestrator(
@@ -184,8 +184,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(["usrp"], [task.agent for task in state.tasks])
         self.assertTrue(all(task.status is TaskStatus.SUCCEEDED for task in state.tasks))
 
-    def test_enabled_registry_runs_device_selection_then_usrp(self) -> None:
-        device_manager = FakeDeviceManagerPort(selection="selected")
+    def test_enabled_registry_runs_device_query_then_usrp(self) -> None:
+        device_manager = FakeDeviceManagerPort()
         usrp = FakeUsrpAgent()
 
         state = Orchestrator(
@@ -198,13 +198,13 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(WorkflowStatus.SUCCEEDED, state.status)
         self.assertEqual(1, device_manager.call_count)
         self.assertEqual(1, usrp.call_count)
-        self.assertEqual("USRP-01", state.results["select_usrp"].data["device_id"])
+        self.assertEqual("USRP-01", state.results["query_usrp"].data["network_devices"][0]["device_id"])
         self.assertEqual(
             ["device_manager", "usrp"], [task.agent for task in state.tasks]
         )
 
     def test_unavailable_device_never_calls_usrp(self) -> None:
-        device_manager = FakeDeviceManagerPort(selection="unavailable")
+        device_manager = FakeDeviceManagerPort(available=False)
         usrp = FakeUsrpAgent()
 
         state = Orchestrator(

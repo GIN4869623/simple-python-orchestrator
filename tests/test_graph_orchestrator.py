@@ -8,7 +8,7 @@ from simple_orchestrator.fakes import (
     FakeKnowledgePort,
     FakeUsrpAgent,
 )
-from simple_orchestrator.graph_orchestrator import GraphOrchestrator, merge_results
+from simple_orchestrator.orchestration.graph import GraphOrchestrator, merge_results
 from simple_orchestrator.models import (
     AgentResult,
     BatchReviewDecision,
@@ -20,7 +20,7 @@ from simple_orchestrator.models import (
     WorkflowStatus,
     PlanStatus,
 )
-from simple_orchestrator.planner import FixedPlanner, OllamaPlanner, PlanningError
+from simple_orchestrator.orchestration.planner import FixedPlanner, OllamaPlanner, PlanningError
 from simple_orchestrator.remote import JsonRpcAgentAdapter, RemoteCallError
 
 
@@ -69,18 +69,37 @@ class GraphOrchestratorTests(unittest.TestCase):
                 Planner(), FakeKnowledgePort(), FakeDeviceManagerPort(), FakeUsrpAgent(),
             ).run("查询可用的 USRP 设备")
 
+    def test_device_query_cannot_request_selection_or_reservation(self) -> None:
+        for capability in ("device.select", "device.reserve"):
+            with self.subTest(capability=capability):
+                class Planner(FixedPlanner):
+                    def create_plan_from_intent(self, user_request, intent):
+                        return TaskPlan(PlanStatus.READY, intent, [
+                            Task("wrong", "device_manager", "越界设备任务", capability=capability),
+                        ])
+
+                device = FakeDeviceManagerPort()
+                with self.assertRaisesRegex(PlanningError, "设备查询只能"):
+                    GraphOrchestrator(
+                        Planner(), FakeKnowledgePort(), device, FakeUsrpAgent(),
+                    ).run("查询有哪些可用设备")
+                self.assertEqual(0, device.call_count)
+
     def test_usrp_preflight_runs_in_parallel_then_enters_hardware(self) -> None:
         barrier = threading.Barrier(2)
+        received = {}
 
         class Knowledge(FakeKnowledgePort):
-            def invoke(self, request):
+            def invoke(self, request, *, metadata=None):
+                received["knowledge"] = request
                 barrier.wait(timeout=2)
-                return super().invoke(request)
+                return super().invoke(request, metadata=metadata)
 
         class Device(FakeDeviceManagerPort):
-            def invoke(self, request):
+            def invoke(self, request, *, metadata=None):
+                received["device_manager"] = request
                 barrier.wait(timeout=2)
-                return super().invoke(request)
+                return super().invoke(request, metadata=metadata)
 
         knowledge, device, usrp = Knowledge(), Device(), FakeUsrpAgent()
         state = GraphOrchestrator(FixedPlanner(), knowledge, device, usrp).run(
@@ -88,19 +107,66 @@ class GraphOrchestratorTests(unittest.TestCase):
         )
 
         self.assertIs(WorkflowStatus.SUCCEEDED, state["status"])
+        self.assertEqual({"knowledge", "device_manager"}, set(received))
+        for request in received.values():
+            self.assertEqual({"message"}, set(request))
+            self.assertIsInstance(request["message"], str)
+            self.assertNotIn("\n", request["message"])
+            self.assertNotIn("current_task", request["message"])
         self.assertEqual(1, knowledge.call_count)
         self.assertEqual(1, device.call_count)
         self.assertEqual(1, usrp.physical_execution_count)
         self.assertEqual(2, len(state["reviews"]))
+        device_result = next(
+            attempts[-1].result for attempts in state["results"].values()
+            if "network_devices" in attempts[-1].result.data
+        )
+        self.assertEqual({"network_devices"}, set(device_result.data))
+        for device in device_result.data["network_devices"]:
+            self.assertNotIn("capabilities", device)
         tasks = state["plan_history"][0].tasks
         self.assertEqual(["knowledge", "device_manager", "usrp"], [task.agent for task in tasks])
         self.assertEqual((tasks[0].task_id, tasks[1].task_id), tasks[2].dependencies)
+
+    def test_orchestrator_chooses_online_usrp_from_query_results(self) -> None:
+        class DeviceQuery(FakeDeviceManagerPort):
+            def invoke(self, request, *, metadata=None):
+                result = super().invoke(request, metadata=metadata)
+                return AgentResult(result.status, result.summary, {"network_devices": [
+                    {"device_id": "offline", "device_type": "usrp", "status": "offline"},
+                    {"device_id": "other", "device_type": "ris", "status": "online"},
+                    *result.data["network_devices"],
+                ]})
+
+        usrp = FakeUsrpAgent()
+        state = GraphOrchestrator(
+            FixedPlanner(), FakeKnowledgePort(), DeviceQuery(), usrp,
+        ).run(USRP_REQUEST)
+
+        self.assertIs(WorkflowStatus.SUCCEEDED, state["status"])
+        self.assertEqual("USRP-01", usrp.received_requests[0]["selected_device"]["device_id"])
+        self.assertEqual(1, usrp.physical_execution_count)
+
+    def test_missing_capability_in_local_inventory_stops_before_usrp(self) -> None:
+        class ReceiveOnlyDevice(FakeDeviceManagerPort):
+            @property
+            def device_capabilities(self):
+                return {self.device_id: ("usrp.receive",)}
+
+        usrp = FakeUsrpAgent()
+        state = GraphOrchestrator(
+            FixedPlanner(), FakeKnowledgePort(), ReceiveOnlyDevice(), usrp,
+        ).run(USRP_REQUEST)
+
+        self.assertIs(WorkflowStatus.FAILED, state["status"])
+        self.assertEqual(0, usrp.physical_execution_count)
+        self.assertIn("前置校验失败", state["final_answer"])
 
     def test_no_device_stops_before_usrp(self) -> None:
         usrp = FakeUsrpAgent()
         state = GraphOrchestrator(
             FixedPlanner(), FakeKnowledgePort(),
-            FakeDeviceManagerPort(selection="unavailable"), usrp,
+            FakeDeviceManagerPort(available=False), usrp,
         ).run(USRP_REQUEST)
 
         self.assertIs(WorkflowStatus.FAILED, state["status"])
@@ -108,6 +174,23 @@ class GraphOrchestratorTests(unittest.TestCase):
         self.assertIn("没有可用设备", state["final_answer"])
         usrp_task = next(t for t in state["plan_history"][0].tasks if t.agent == "usrp")
         self.assertIs(TaskStatus.SKIPPED, state["task_statuses"][usrp_task.task_id])
+
+    def test_empty_successful_query_only_blocks_hardware_execution(self) -> None:
+        class EmptyDeviceQuery(FakeDeviceManagerPort):
+            def invoke(self, request, *, metadata=None):
+                return AgentResult(ResultStatus.SUCCEEDED, "未查到设备", {"network_devices": []})
+
+        usrp = FakeUsrpAgent()
+        for request, expected in (
+            ("查询有哪些可用设备", WorkflowStatus.SUCCEEDED),
+            (USRP_REQUEST, WorkflowStatus.FAILED),
+        ):
+            with self.subTest(request=request):
+                state = GraphOrchestrator(
+                    FixedPlanner(), FakeKnowledgePort(), EmptyDeviceQuery(), usrp,
+                ).run(request)
+                self.assertIs(expected, state["status"])
+        self.assertEqual(0, usrp.call_count)
 
     def test_invalid_skill_never_executes_physical_operation(self) -> None:
         knowledge = FakeKnowledgePort(skill_read_failure=True)
@@ -124,11 +207,11 @@ class GraphOrchestratorTests(unittest.TestCase):
 
     def test_only_failed_task_is_retried_and_attempts_are_preserved(self) -> None:
         class FlakyKnowledge(FakeKnowledgePort):
-            def invoke(self, request):
+            def invoke(self, request, *, metadata=None):
                 if self.call_count == 0:
                     self.call_count += 1
                     return AgentResult(ResultStatus.FAILED, "第一次 Skill 查询失败", error="transient")
-                return super().invoke(request)
+                return super().invoke(request, metadata=metadata)
 
         knowledge, device = FlakyKnowledge(), FakeDeviceManagerPort()
         state = GraphOrchestrator(
@@ -158,11 +241,11 @@ class GraphOrchestratorTests(unittest.TestCase):
                 return BatchReviewDecision(NextAction.COMPLETE, "任务成功")
 
         class Knowledge(FakeKnowledgePort):
-            def invoke(self, request):
-                if request["current_task"]["task_id"] == "answer_knowledge":
+            def invoke(self, request, *, metadata=None):
+                if metadata["task_id"] == "answer_knowledge":
                     self.call_count += 1
                     return AgentResult(ResultStatus.FAILED, "原知识任务失败", error="source_unavailable")
-                return super().invoke(request)
+                return super().invoke(request, metadata=metadata)
 
         state = GraphOrchestrator(
             Planner(), Knowledge(), FakeDeviceManagerPort(), FakeUsrpAgent(),
@@ -181,6 +264,55 @@ class GraphOrchestratorTests(unittest.TestCase):
         ).run(USRP_REQUEST)
         self.assertIs(WorkflowStatus.UNKNOWN, state["status"])
         self.assertEqual(1, usrp.call_count)
+
+    def test_ollama_replan_id_correction_preserves_task_history(self) -> None:
+        class Planner(OllamaPlanner):
+            def analyze_intent(self, request):
+                return FixedPlanner().analyze_intent(request)
+
+            def create_plan_from_intent(self, request, intent):
+                return FixedPlanner().create_plan_from_intent(request, intent)
+
+        def task(task_id):
+            return {
+                "task_id": task_id, "agent": "knowledge",
+                "capability": "knowledge.explain", "description": "解释 QPSK 原理",
+                "inputs": {}, "expected_output": ["knowledge"],
+                "completion_criteria": ["解释调制原理"], "dependencies": [],
+            }
+
+        planner = Planner(model="local-model")
+        responses = [
+            {"action": "replan", "reason": "补充知识回答", "retry_task_ids": [],
+             "revised_tasks": [task("answer_knowledge")]},
+            {"tasks": [task("answer_knowledge_v2")]},
+            {"action": "complete", "reason": "已完成", "retry_task_ids": [], "revised_tasks": []},
+        ]
+        knowledge, device, usrp = FakeKnowledgePort(), FakeDeviceManagerPort(), FakeUsrpAgent()
+        with patch.object(planner, "_chat", side_effect=[
+            {"message": {"content": json.dumps(response)}} for response in responses
+        ]) as chat:
+            state = GraphOrchestrator(planner, knowledge, device, usrp).run("解释QPSK原理")
+
+        self.assertIs(WorkflowStatus.SUCCEEDED, state["status"])
+        self.assertEqual(1, state["replan_count"])
+        self.assertEqual(["answer_knowledge"], [t.task_id for t in state["plan_history"][0].tasks])
+        self.assertEqual(
+            ["answer_knowledge", "answer_knowledge_v2"],
+            [t.task_id for t in state["plan_history"][1].tasks],
+        )
+        for task_id, version in (("answer_knowledge", 1), ("answer_knowledge_v2", 2)):
+            self.assertEqual(1, len(state["results"][task_id]))
+            attempt = state["results"][task_id][0]
+            self.assertEqual(version, attempt.plan_version)
+            self.assertEqual(state["request_id"], attempt.request_id)
+        self.assertEqual(2, knowledge.call_count)
+        self.assertEqual(0, device.call_count)
+        self.assertEqual(0, usrp.call_count)
+        self.assertEqual(
+            ["batch_review", "replan_id_correction", "batch_review"],
+            [call.kwargs["phase"] for call in chat.call_args_list],
+        )
 
     def test_fixed_planner_replans_once_after_retry_exhaustion(self) -> None:
         knowledge = FakeKnowledgePort(outcome=ResultStatus.FAILED)
@@ -279,7 +411,15 @@ class JsonRpcAdapterTests(unittest.TestCase):
         adapter = JsonRpcAgentAdapter("http://device-host/rpc", "device_manager")
         result = adapter.invoke({
             "request_id": "req-1", "user_request": "查询设备",
-            "current_task": {"task_id": "T1", "attempt": 1},
+            "current_task": {
+                "task_id": "T1", "attempt": 1,
+                "description": "查找在线的 USRP 设备并报告能力",
+                "capability": "device.list",
+                "inputs": {"target_type": "usrp"},
+                "expected_output": ["设备清单和能力"],
+                "completion_criteria": ["返回在线状态"],
+            },
+            "previous_results": {"K1": {"skill_id": "skill-1"}},
         })
         self.assertIs(ResultStatus.SUCCEEDED, result.status)
         request = urlopen.call_args.args[0]
@@ -287,6 +427,69 @@ class JsonRpcAdapterTests(unittest.TestCase):
         payload = json.loads(request.data)
         self.assertEqual("req-1:T1:1", payload["id"])
         self.assertEqual("tasks.send", payload["method"])
+        params = payload["params"]
+        self.assertEqual({"message"}, set(params))
+        message = params["message"]
+        self.assertIn("请完成以下任务：查找在线的 USRP 设备并报告能力", message)
+        self.assertIn("目标设备类型为usrp", message)
+        self.assertIn("设备清单和能力", message)
+        self.assertIn("返回在线状态", message)
+        self.assertIn("操作指导编号为skill-1", message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("device.list", message)
+        self.assertNotIn("task", params)
+        self.assertNotIn("context", params)
+        self.assertNotIn("previous_results", params)
+
+    @patch("simple_orchestrator.remote.urlopen")
+    def test_knowledge_receives_natural_language_with_nested_context(self, urlopen: MagicMock) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "jsonrpc": "2.0", "id": "req-2:K1:1",
+            "result": {"task_id": "K1", "status": "succeeded", "summary": "解释完成"},
+        }).encode()
+        urlopen.return_value = response
+        adapter = JsonRpcAgentAdapter("http://knowledge-host/rpc", "knowledge")
+        result = adapter.invoke({
+            "request_id": "req-2", "user_request": "解释 QPSK",
+            "current_task": {
+                "task_id": "K1", "attempt": 1, "description": "结合已知条件解释 QPSK",
+                "inputs": {"参数": {"增益": 0, "启用": False, "频率": None}, "参考": ["资料甲", "资料乙"]},
+            },
+            "skill_ref": {"skill_id": "guide-1", "version": "1"},
+            "selected_device": {"device_id": "USRP-01"},
+        })
+        self.assertIs(ResultStatus.SUCCEEDED, result.status)
+        params = json.loads(urlopen.call_args.args[0].data)["params"]
+        self.assertEqual({"message"}, set(params))
+        message = params["message"]
+        self.assertTrue(message.startswith("结合已知条件解释 QPSK"))
+        self.assertIn("参数为（增益为0；启用为否；频率为未提供）", message)
+        self.assertIn("参考为（资料甲、资料乙）", message)
+        self.assertIn("操作指导：操作指导编号为guide-1；版本为1", message)
+        self.assertIn("设备：设备编号为USRP-01", message)
+        self.assertNotIn("{", message)
+        self.assertNotIn("task", params)
+        self.assertNotIn("context", params)
+
+    @patch("simple_orchestrator.remote.urlopen")
+    def test_physical_task_context_includes_skill_and_device(self, urlopen: MagicMock) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "jsonrpc": "2.0", "id": "req-1:T2:1",
+            "result": {"task_id": "T2", "status": "succeeded", "summary": "完成"},
+        }).encode()
+        urlopen.return_value = response
+        adapter = JsonRpcAgentAdapter("http://usrp-host/rpc", "usrp")
+        adapter.execute({
+            "request_id": "req-1", "user_request": "发射 QPSK",
+            "current_task": {"task_id": "T2", "attempt": 1, "description": "发射 QPSK"},
+            "skill_ref": {"skill_id": "skill-1"},
+            "selected_device": {"device_id": "USRP-01"},
+        })
+        params = json.loads(urlopen.call_args.args[0].data)["params"]
+        self.assertEqual({"skill_id": "skill-1"}, params["context"]["skill_ref"])
+        self.assertEqual({"device_id": "USRP-01"}, params["context"]["selected_device"])
 
     @patch("simple_orchestrator.remote.urlopen")
     def test_mismatched_response_id_is_rejected(self, urlopen: MagicMock) -> None:
@@ -301,7 +504,7 @@ class JsonRpcAdapterTests(unittest.TestCase):
 
 
 class OllamaGraphTests(unittest.TestCase):
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_usrp_device_inventory_uses_only_device_manager(self, urlopen: MagicMock) -> None:
         payloads = [
             {
@@ -351,7 +554,7 @@ class OllamaGraphTests(unittest.TestCase):
         self.assertEqual(0, usrp.call_count)
         self.assertEqual(3, urlopen.call_count)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_ollama_device_query_cannot_route_to_usrp(self, urlopen: MagicMock) -> None:
         payloads = [
             {
@@ -386,7 +589,7 @@ class OllamaGraphTests(unittest.TestCase):
         self.assertEqual(0, device.call_count)
         self.assertEqual(0, usrp.call_count)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_analyze_plan_and_batch_review_are_separate_calls(self, urlopen: MagicMock) -> None:
         payloads = [
             {

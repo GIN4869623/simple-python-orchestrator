@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": "demo-1:T1:1",
+  "method": "tasks.send",
+  "params": {
+    "message": "请查询当前可用的 USRP 设备，列出设备编号、型号、在线状态和连接状态，只读取信息，不执行硬件操作。"
+  }
+}

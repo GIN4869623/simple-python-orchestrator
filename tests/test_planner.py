@@ -17,7 +17,7 @@ from simple_orchestrator.models import (
     TaskStatus,
     WorkflowState,
 )
-from simple_orchestrator.planner import OllamaPlanner, PlanningError
+from simple_orchestrator.orchestration.planner import OllamaPlanner, PlanningError
 
 
 def hardware_intent(*, missing: list[str] | None = None) -> dict:
@@ -59,7 +59,7 @@ def task_data(
     if agent == "usrp":
         inputs = {"operation": capability.removeprefix("usrp.")}
         if dependencies:
-            inputs["device_id_from"] = f"{dependencies[-1]}.device_id"
+            inputs["device_candidates_from"] = f"{dependencies[-1]}.network_devices"
     return {
         "task_id": task_id,
         "agent": agent,
@@ -74,6 +74,30 @@ def task_data(
 
 class OllamaPlannerTests(unittest.TestCase):
     @staticmethod
+    def _replan_context() -> dict:
+        return {
+            "user_request": "解释QPSK原理",
+            "known_task_ids": ["task_1", "failed_task", "pending_task"],
+            "successful_task_ids": ["task_1"],
+            "retryable_task_ids": [],
+            "can_replan": True,
+            "intent_analysis": {
+                "intent_type": "knowledge_query",
+                "domain": "wireless_communication",
+                "target_type": None,
+                "action": "explain",
+                "execution_mode": "read_only",
+                "required_capabilities": ["knowledge.explain"],
+                "provided_parameters": {},
+                "missing_parameters": [],
+                "needs_clarification": False,
+                "evidence": "解释QPSK原理",
+                "reason": "用户请求知识解释",
+            },
+            "current_plan": [],
+        }
+
+    @staticmethod
     def _ollama_response(payload: dict) -> MagicMock:
         response = MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(
@@ -81,7 +105,7 @@ class OllamaPlannerTests(unittest.TestCase):
         ).encode("utf-8")
         return response
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_batch_review_non_replan_requests_empty_revised_tasks(
         self, urlopen: MagicMock
     ) -> None:
@@ -103,8 +127,97 @@ class OllamaPlannerTests(unittest.TestCase):
         instructions = request_body["messages"][0]["content"]
         self.assertIn("revised_tasks 必须是空数组 []", instructions)
         self.assertIn("不得复制当前计划或待执行任务", instructions)
+        self.assertIn("不得使用 known_task_ids 中的任何 ID", instructions)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_replan_corrects_reserved_ids_once_and_logs_correction(self, urlopen):
+        for reserved_id in ("task_1", "failed_task", "pending_task"):
+            with self.subTest(reserved_id=reserved_id), tempfile.TemporaryDirectory() as directory:
+                invalid = task_data(reserved_id, "knowledge", "knowledge.explain", [])
+                corrected = task_data("task_2", "knowledge", "knowledge.explain", ["task_1"])
+                review = {
+                    "action": "replan", "reason": "知识结果不足",
+                    "retry_task_ids": [], "revised_tasks": [invalid],
+                }
+                urlopen.reset_mock()
+                urlopen.side_effect = [
+                    self._ollama_response(review),
+                    self._ollama_response({"tasks": [corrected]}),
+                ]
+                log_path = Path(directory) / "responses.json"
+                decision = OllamaPlanner(model="local-model", log_path=log_path).review_batch(
+                    self._replan_context(),
+                )
+                self.assertIs(NextAction.REPLAN, decision.action)
+                self.assertEqual("知识结果不足", decision.reason)
+                self.assertEqual("task_2", decision.revised_tasks[0].task_id)
+                self.assertEqual(["task_1"], decision.revised_tasks[0].dependencies)
+                self.assertEqual(reserved_id, invalid["task_id"])
+                self.assertEqual(2, urlopen.call_count)
+                correction = json.loads(urlopen.call_args.args[0].data)
+                prompt = json.loads(correction["messages"][1]["content"])
+                self.assertIn(reserved_id, prompt["validation_error"])
+                self.assertEqual([invalid], prompt["invalid_plan"]["tasks"])
+                entries = json.loads(log_path.read_text())["entries"]
+                self.assertEqual(["batch_review", "replan_id_correction"], [e["phase"] for e in entries])
+
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_replan_corrects_duplicate_ids_within_new_plan(self, urlopen):
+        urlopen.side_effect = [
+            self._ollama_response({
+                "action": "replan", "reason": "拆分问题", "retry_task_ids": [],
+                "revised_tasks": [task_data("new", "knowledge", "knowledge.explain", [])] * 2,
+            }),
+            self._ollama_response({"tasks": [
+                task_data("new_1", "knowledge", "knowledge.explain", []),
+                task_data("new_2", "knowledge", "knowledge.explain", ["new_1"]),
+            ]}),
+        ]
+        decision = OllamaPlanner(model="local-model").review_batch(self._replan_context())
+        self.assertEqual(["new_1", "new_2"], [t.task_id for t in decision.revised_tasks])
+        self.assertEqual(["new_1"], decision.revised_tasks[1].dependencies)
+
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_invalid_id_correction_fails_without_a_third_model_call(self, urlopen):
+        for corrected, error in (
+            ([task_data("task_1", "knowledge", "knowledge.explain", [])], "任务 ID 重复"),
+            ([task_data("new", "knowledge", "knowledge.explain", ["failed_task"])], "依赖尚未出现"),
+            ([task_data("new", "knowledge", "knowledge.explain", ["pending_task"])], "依赖尚未出现"),
+        ):
+            with self.subTest(error=error, corrected=corrected):
+                urlopen.reset_mock()
+                urlopen.side_effect = [
+                    self._ollama_response({
+                        "action": "replan", "reason": "重规划", "retry_task_ids": [],
+                        "revised_tasks": [task_data("task_1", "knowledge", "knowledge.explain", [])],
+                    }),
+                    self._ollama_response({"tasks": corrected}),
+                ]
+                with self.assertRaisesRegex(PlanningError, error):
+                    OllamaPlanner(model="local-model").review_batch(self._replan_context())
+                self.assertEqual(2, urlopen.call_count)
+
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_valid_replan_needs_no_correction(self, urlopen):
+        urlopen.return_value = self._ollama_response({
+            "action": "replan", "reason": "重规划", "retry_task_ids": [],
+            "revised_tasks": [task_data("new", "knowledge", "knowledge.explain", [])],
+        })
+        decision = OllamaPlanner(model="local-model").review_batch(self._replan_context())
+        self.assertEqual("new", decision.revised_tasks[0].task_id)
+        self.assertEqual(1, urlopen.call_count)
+
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_other_replan_errors_do_not_trigger_id_correction(self, urlopen):
+        urlopen.return_value = self._ollama_response({
+            "action": "replan", "reason": "重规划", "retry_task_ids": [],
+            "revised_tasks": [task_data("new", "knowledge", "knowledge.explain", ["failed_task"])],
+        })
+        with self.assertRaisesRegex(PlanningError, "依赖尚未出现"):
+            OllamaPlanner(model="local-model").review_batch(self._replan_context())
+        self.assertEqual(1, urlopen.call_count)
+
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_batch_review_still_rejects_non_replan_with_revised_tasks(
         self, urlopen: MagicMock
     ) -> None:
@@ -121,7 +234,7 @@ class OllamaPlannerTests(unittest.TestCase):
                 "retryable_task_ids": [],
             })
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_registry_accepts_usrp_read_only_knowledge_task(
         self, urlopen: MagicMock
     ) -> None:
@@ -153,23 +266,23 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertEqual("usrp", plan.tasks[0].agent)
         self.assertEqual("knowledge.explain", plan.tasks[0].capability)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_analyzes_intent_then_plans_with_registry_candidates(
         self, urlopen: MagicMock
     ) -> None:
         plan_payload = {
             "tasks": [
-                task_data("select_usrp", "device_manager", "device.select", []),
+                task_data("query_usrp", "device_manager", "device.list", []),
                 task_data(
                     "transmit",
                     "usrp",
                     "usrp.transmit",
-                    ["select_usrp"],
+                    ["query_usrp"],
                 ),
             ]
         }
         plan_payload["tasks"][1]["inputs"] = {
-            "device_id": "select_usrp.device_id",
+            "device_candidates_from": "query_usrp.network_devices",
             "operation": "transmit",
         }
         urlopen.side_effect = [
@@ -197,17 +310,17 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertNotIn('"agent_id": "knowledge"', planning_content)
         self.assertEqual(0.6, planning_request["options"]["temperature"])
 
-    @patch("simple_orchestrator.planner.urlopen")
-    def test_enabled_registry_injects_device_selection(
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_enabled_registry_injects_device_query(
         self, urlopen: MagicMock
     ) -> None:
         intent_payload = hardware_intent()
         intent_payload["required_capabilities"] = ["usrp.transmit"]
         plan_payload = {
             "tasks": [
-                task_data("select_usrp", "device_manager", "device.select", []),
+                task_data("query_usrp", "device_manager", "device.list", []),
                 task_data(
-                    "transmit", "usrp", "usrp.transmit", ["select_usrp"]
+                    "transmit", "usrp", "usrp.transmit", ["query_usrp"]
                 ),
             ]
         }
@@ -222,7 +335,7 @@ class OllamaPlannerTests(unittest.TestCase):
         ).create_plan("使用 USRP 发射 QPSK 信号")
 
         self.assertEqual(
-            ["device.select", "usrp.transmit"],
+            ["device.list", "usrp.transmit"],
             plan.intent.required_capabilities,
         )
         planning_request = json.loads(
@@ -231,7 +344,7 @@ class OllamaPlannerTests(unittest.TestCase):
         planning_content = planning_request["messages"][1]["content"]
         self.assertIn('"agent_id": "device_manager"', planning_content)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_incomplete_usrp_intent_stops_before_planning(
         self, urlopen: MagicMock
     ) -> None:
@@ -246,7 +359,7 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertIn("请提供中心频率", plan.clarification_questions)
         self.assertEqual(1, urlopen.call_count)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_demo_policy_passes_missing_parameters_to_planner(
         self, urlopen: MagicMock
     ) -> None:
@@ -285,7 +398,7 @@ class OllamaPlannerTests(unittest.TestCase):
             planning_request["messages"][1]["content"],
         )
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_non_usrp_hardware_is_unsupported_without_planning(
         self, urlopen: MagicMock
     ) -> None:
@@ -306,7 +419,7 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertEqual([], plan.tasks)
         self.assertEqual(1, urlopen.call_count)
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_hardware_gate_requires_usrp_in_original_request(
         self, urlopen: MagicMock
     ) -> None:
@@ -320,8 +433,8 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertIn("明确指定 USRP", plan.reason)
         self.assertEqual(1, urlopen.call_count)
 
-    @patch("simple_orchestrator.planner.urlopen")
-    def test_registry_disabled_accepts_usrp_without_device_selection(
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_registry_disabled_accepts_usrp_without_device_query(
         self, urlopen: MagicMock
     ) -> None:
         registry = MagicMock()
@@ -352,8 +465,8 @@ class OllamaPlannerTests(unittest.TestCase):
         self.assertNotIn('"agent_id": "device_manager"', planning_content)
         registry.match.assert_not_called()
 
-    @patch("simple_orchestrator.planner.urlopen")
-    def test_enabled_registry_rejects_usrp_without_device_selection(
+    @patch("simple_orchestrator.ollama.urlopen")
+    def test_enabled_registry_rejects_usrp_without_device_query(
         self, urlopen: MagicMock
     ) -> None:
         urlopen.side_effect = [
@@ -367,13 +480,13 @@ class OllamaPlannerTests(unittest.TestCase):
             ),
         ]
 
-        with self.assertRaisesRegex(PlanningError, "必须依赖 device.select"):
+        with self.assertRaisesRegex(PlanningError, "必须依赖设备查询任务"):
             OllamaPlanner(
                 model="local-model",
                 enable_agent_registry=True,
             ).create_plan("使用 USRP 发射信号")
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_reviews_result_with_structured_decision(self, urlopen: MagicMock) -> None:
         urlopen.return_value = self._ollama_response(
             {
@@ -415,7 +528,7 @@ class OllamaPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanningError, "必须在 0 到 2 之间"):
             OllamaPlanner(model="local-model", temperature=2.1).create_plan("测试")
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_planning_timeout_reports_phase_and_limit(
         self, urlopen: MagicMock
     ) -> None:
@@ -431,7 +544,7 @@ class OllamaPlannerTests(unittest.TestCase):
                 "使用 USRP 发射 QPSK 信号"
             )
 
-    @patch("simple_orchestrator.planner.urlopen")
+    @patch("simple_orchestrator.ollama.urlopen")
     def test_log_keeps_only_the_latest_twenty_responses(
         self, urlopen: MagicMock
     ) -> None:

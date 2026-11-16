@@ -6,10 +6,18 @@ import argparse
 import os
 import sys
 
-from .config import load_dotenv
-from .fakes import FakeDeviceManagerPort, FakeKnowledgePort, FakeUsrpAgent
-from .graph_orchestrator import GraphOrchestrator
-from .models import (
+from ..agent_logging import AgentMessageLog, LoggedFakeAgent
+from ..config import load_dotenv
+from ..fakes import FakeDeviceManagerPort, FakeKnowledgePort, FakeUsrpAgent
+from .graph import GraphOrchestrator
+from .execution import WorkflowExecutor
+from ..intent.agent import FixedIntentAgent, OllamaIntentAgent
+from ..intent.client import IntentHttpClient
+from ..ollama import OllamaClient
+from .router import RequestRouter
+from ..knowledge_http import DEFAULT_KNOWLEDGE_API_URL, KnowledgeHttpAdapter
+from ..models import (
+    HandlingMode,
     IntentAnalysis,
     NextAction,
     ParameterPolicy,
@@ -19,12 +27,13 @@ from .models import (
     WorkflowStatus,
 )
 from .planner import FixedPlanner, OllamaPlanner, PlanningError
-from .remote import JsonRpcAgentAdapter
+from ..remote import JsonRpcAgentAdapter
+from ..tcp_transport import TcpJsonRpcAgentAdapter
 
 
 AGENT_NAMES = {
     "knowledge": "知识智能体",
-    "device_manager": "设备管理智能体",
+    "device_manager": "网络监管智能体",
     "usrp": "USRP 硬件智能体",
 }
 
@@ -60,12 +69,14 @@ FAKE_OUTCOME_CHOICES = {
     "4": ResultStatus.FAILED,
 }
 
+MAX_CLARIFICATION_ROUNDS = 5
 
-def describe_plan(tasks: list[Task], planner_name: str) -> str:
+
+def describe_plan(tasks: list[Task], planner_name: str, *, heading: str | None = None) -> str:
     """Convert parsed Task objects into a human-readable plan."""
 
     task_numbers = {task.task_id: index for index, task in enumerate(tasks, start=1)}
-    lines = [f"{planner_name}规划结果（已解析）："]
+    lines = [heading or f"{planner_name}规划结果（已解析）："]
     for index, task in enumerate(tasks, start=1):
         agent_name = AGENT_NAMES.get(task.agent, task.agent)
         lines.append(f"{index}. {agent_name}负责：{task.description}")
@@ -110,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--planner",
         choices=["ollama", "fixed"],
         default="ollama",
-        help="计划来源；默认调用本地 Ollama",
+        help="动态规划的实现；意图识别默认调用独立服务",
     )
     parser.add_argument(
         "--ollama-url",
@@ -140,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="最近 20 次 LLM 返回的日志路径，也可通过 OLLAMA_LOG_PATH 配置",
     )
     parser.add_argument(
+        "--agent-log-path",
+        default=os.getenv("ORCHESTRATOR_AGENT_LOG_PATH", "logs/agent_messages.jsonl"),
+        help="知识与网络监管智能体完整收发日志的路径",
+    )
+    parser.add_argument(
         "--fake-outcome",
         choices=[status.value for status in FAKE_OUTCOME_NAMES],
         help="跳过交互菜单，直接指定所有 Fake 的回复方案",
@@ -147,9 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-agents",
         action="store_true",
-        help="通过静态配置的 HTTP + JSON-RPC 地址调用远程智能体",
+        help="通过静态配置的 HTTP(S) 或 TCP 地址调用远程智能体",
     )
     parser.add_argument("--knowledge-rpc-url", default=os.getenv("KNOWLEDGE_RPC_URL", ""))
+    parser.add_argument(
+        "--knowledge-api-url", nargs="?", const=DEFAULT_KNOWLEDGE_API_URL,
+        default=os.getenv("KNOWLEDGE_API_URL", ""),
+        help="启用真实知识 HTTP JSON 接口；省略地址时使用已记录的局域网地址",
+    )
     parser.add_argument("--device-rpc-url", default=os.getenv("DEVICE_MANAGER_RPC_URL", ""))
     parser.add_argument("--usrp-rpc-url", default=os.getenv("USRP_RPC_URL", ""))
     parser.add_argument(
@@ -181,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
         .lower()
         in {"1", "true", "yes", "on"},
         help=(
-            "启用能力仓库匹配、device.select 注入和严格计划校验；"
+            "启用能力仓库匹配、设备查询前置任务和严格计划校验；"
             "默认关闭"
         ),
     )
@@ -198,6 +219,22 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[0, 1],
         default=int(os.getenv("ORCHESTRATOR_MAX_REPLANS", "1")),
         help="整个工作流最多重新规划次数，只能为 0 或 1",
+    )
+    parser.add_argument(
+        "--intent-service-url", default=os.getenv("INTENT_SERVICE_URL", "http://127.0.0.1:18003"),
+        help="独立意图识别服务地址，默认 http://127.0.0.1:18003",
+    )
+    parser.add_argument(
+        "--intent-timeout", type=float, default=float(os.getenv(
+            "INTENT_SERVICE_TIMEOUT",
+            str(max(180.0, float(os.getenv("INTENT_OLLAMA_TIMEOUT") or os.getenv("OLLAMA_TIMEOUT", "120")) + 30)),
+        )),
+        help="等待意图识别服务的超时秒数",
+    )
+    parser.add_argument(
+        "--local-intent", action="store_true",
+        default=os.getenv("ORCHESTRATOR_LOCAL_INTENT", "0").strip().lower() in {"1", "true", "yes", "on"},
+        help="仅供本地调试：在当前进程识别意图，不连接独立意图服务",
     )
     return parser
 
@@ -224,6 +261,111 @@ def choose_fake_outcome(configured_outcome: str | None) -> ResultStatus:
         print("无效序号，请输入 1、2、3 或 4。")
 
 
+def build_orchestrator(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> tuple[RequestRouter, ResultStatus | None]:
+    """Build the same runtime for the CLI and HTTP entry points."""
+
+    message_log = AgentMessageLog(args.agent_log_path)
+    if args.remote_agents:
+        if args.parameter_policy != ParameterPolicy.STRICT.value:
+            parser.error("远程硬件模式必须使用 --parameter-policy strict")
+        if args.fake_outcome is not None:
+            parser.error("远程智能体模式不能同时指定 --fake-outcome")
+        if not all((args.knowledge_api_url or args.knowledge_rpc_url, args.device_rpc_url, args.usrp_rpc_url)):
+            parser.error("远程智能体模式必须配置 Knowledge、DeviceManager 和 USRP 地址")
+        fake_outcome = None
+        token = os.getenv("ORCHESTRATOR_RPC_TOKEN")
+        def make_adapter(endpoint: str, agent_id: str) -> JsonRpcAgentAdapter:
+            adapter_type = TcpJsonRpcAgentAdapter if endpoint.startswith("tcp://") else JsonRpcAgentAdapter
+            return adapter_type(endpoint, agent_id, timeout=args.rpc_timeout,
+                                auth_token=token,
+                                message_log=message_log if agent_id != "usrp" else None)
+
+        knowledge = (
+            KnowledgeHttpAdapter(args.knowledge_api_url, timeout=args.rpc_timeout,
+                                 api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log)
+            if args.knowledge_api_url else make_adapter(args.knowledge_rpc_url, "knowledge")
+        )
+        device_manager = make_adapter(args.device_rpc_url, "device_manager")
+        usrp = make_adapter(args.usrp_rpc_url, "usrp")
+    else:
+        configured_fake_outcome = args.fake_outcome
+        if configured_fake_outcome is None and args.knowledge_api_url:
+            configured_fake_outcome = ResultStatus.SUCCEEDED.value
+        fake_outcome = choose_fake_outcome(configured_fake_outcome)
+        knowledge = (
+            KnowledgeHttpAdapter(args.knowledge_api_url, timeout=args.rpc_timeout,
+                                 api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log)
+            if args.knowledge_api_url else
+            LoggedFakeAgent(FakeKnowledgePort(outcome=fake_outcome), "knowledge", message_log)
+        )
+        device_manager = FakeDeviceManagerPort(
+            device_id=args.device_id,
+            outcome=fake_outcome,
+        )
+        usrp = FakeUsrpAgent(outcome=fake_outcome)
+        device_manager = LoggedFakeAgent(device_manager, "device_manager", message_log)
+    parameter_policy = ParameterPolicy(args.parameter_policy)
+
+    if args.planner == "ollama":
+        if not args.ollama_model:
+            parser.error(
+                "使用 Ollama Planner 时必须设置 OLLAMA_MODEL 或 --ollama-model"
+            )
+        model_options = {
+            "model": args.ollama_model,
+            "base_url": args.ollama_url,
+            "timeout": args.ollama_timeout,
+            "temperature": args.ollama_temperature,
+            "log_path": args.ollama_log_path,
+        }
+        client = OllamaClient(**model_options)
+        planner = OllamaPlanner(
+            **model_options, client=client,
+            parameter_policy=parameter_policy,
+            enable_agent_registry=args.enable_agent_registry,
+        )
+    else:
+        planner = FixedPlanner(
+            parameter_policy=parameter_policy,
+            enable_agent_registry=args.enable_agent_registry,
+        )
+
+    if args.local_intent:
+        intent_agent = (
+            OllamaIntentAgent(client, parameter_policy=parameter_policy)
+            if args.planner == "ollama" else FixedIntentAgent(parameter_policy=parameter_policy)
+        )
+    else:
+        try:
+            intent_agent = IntentHttpClient(
+                base_url=args.intent_service_url, timeout=args.intent_timeout,
+                auth_token=(os.getenv("INTENT_API_TOKEN") or os.getenv("ORCHESTRATOR_API_TOKEN", "")).strip(),
+                parameter_policy=parameter_policy,
+            )
+        except PlanningError as exc:
+            parser.error(str(exc))
+
+    orchestrator = GraphOrchestrator(
+        planner=planner,
+        knowledge=knowledge,
+        device_manager=device_manager,
+        usrp=usrp,
+        max_retries=args.max_retries,
+        max_replans=args.max_replans,
+    )
+    executor = WorkflowExecutor(
+        knowledge=knowledge, device_manager=device_manager, usrp=usrp,
+        max_retries=args.max_retries,
+    )
+    runtime = RequestRouter(
+        intent_agent=intent_agent, executor=executor, orchestrator=orchestrator,
+        registry=planner.registry, enable_agent_registry=args.enable_agent_registry,
+    )
+    return runtime, fake_outcome
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -236,72 +378,19 @@ def main() -> int:
         if not user_request:
             parser.error("任务请求不能为空")
 
-    if args.remote_agents:
-        if args.parameter_policy != ParameterPolicy.STRICT.value:
-            parser.error("远程硬件模式必须使用 --parameter-policy strict")
-        if args.fake_outcome is not None:
-            parser.error("远程智能体模式不能同时指定 --fake-outcome")
-        if not all((args.knowledge_rpc_url, args.device_rpc_url, args.usrp_rpc_url)):
-            parser.error("远程智能体模式必须配置 Knowledge、DeviceManager 和 USRP 地址")
-        fake_outcome = None
-        token = os.getenv("ORCHESTRATOR_RPC_TOKEN")
-        knowledge = JsonRpcAgentAdapter(
-            args.knowledge_rpc_url, "knowledge", timeout=args.rpc_timeout,
-            auth_token=token,
-        )
-        device_manager = JsonRpcAgentAdapter(
-            args.device_rpc_url, "device_manager", timeout=args.rpc_timeout,
-            auth_token=token,
-        )
-        usrp = JsonRpcAgentAdapter(
-            args.usrp_rpc_url, "usrp", timeout=args.rpc_timeout,
-            auth_token=token,
-        )
-    else:
-        fake_outcome = choose_fake_outcome(args.fake_outcome)
-        knowledge = FakeKnowledgePort(outcome=fake_outcome)
-        device_manager = FakeDeviceManagerPort(
-            device_id=args.device_id,
-            outcome=fake_outcome,
-        )
-        usrp = FakeUsrpAgent(outcome=fake_outcome)
+    orchestrator, fake_outcome = build_orchestrator(args, parser)
     parameter_policy = ParameterPolicy(args.parameter_policy)
-
-    if args.planner == "ollama":
-        if not args.ollama_model:
-            parser.error(
-                "使用 Ollama Planner 时必须设置 OLLAMA_MODEL 或 --ollama-model"
-            )
-        planner = OllamaPlanner(
-            model=args.ollama_model,
-            base_url=args.ollama_url,
-            timeout=args.ollama_timeout,
-            temperature=args.ollama_temperature,
-            log_path=args.ollama_log_path,
-            parameter_policy=parameter_policy,
-            enable_agent_registry=args.enable_agent_registry,
-        )
-    else:
-        planner = FixedPlanner(
-            parameter_policy=parameter_policy,
-            enable_agent_registry=args.enable_agent_registry,
-        )
-
-    orchestrator = GraphOrchestrator(
-        planner=planner,
-        knowledge=knowledge,
-        device_manager=device_manager,
-        usrp=usrp,
-        max_retries=args.max_retries,
-        max_replans=args.max_replans,
-    )
     try:
         state = orchestrator.run(user_request)
+        clarification_rounds = 0
         while (
             state["status"] is WorkflowStatus.NEEDS_CLARIFICATION
             and parameter_policy is ParameterPolicy.STRICT
         ):
             print(state["final_answer"])
+            if clarification_rounds >= MAX_CLARIFICATION_ROUNDS:
+                print(f"已达到最多 {MAX_CLARIFICATION_ROUNDS} 轮参数补充，本次请求结束。")
+                break
             try:
                 supplement = input(
                     "请补充上述参数（直接回车结束本次请求）："
@@ -310,6 +399,7 @@ def main() -> int:
                 break
             if not supplement:
                 break
+            clarification_rounds += 1
             user_request = f"{user_request}\n用户补充：{supplement}"
             state = orchestrator.run(user_request)
     except PlanningError as exc:
@@ -320,9 +410,16 @@ def main() -> int:
     if state.get("intent") is not None:
         print(describe_intent(state["intent"]))
     tasks = list(state["plan_history"][-1].tasks) if state["plan_history"] else []
-    print(describe_plan(tasks, planner_name))
+    mode = state.get("handling_mode", HandlingMode.ORCHESTRATED)
+    heading = {
+        HandlingMode.DIRECT: "处理方式：直接调用；执行任务：",
+        HandlingMode.FIXED_WORKFLOW: "处理方式：固定流程；执行任务：",
+    }.get(mode)
+    print(describe_plan(tasks, planner_name, heading=heading))
     if fake_outcome is None:
-        print("\n执行结果（当前后端为远程 JSON-RPC 智能体）：")
+        print("\n执行结果（当前后端为远程智能体）：")
+    elif args.knowledge_api_url:
+        print("\n执行结果（知识智能体使用真实 HTTP 接口，其余后端为 Fake）：")
     else:
         print(
             "\n执行结果（当前后端为 Fake，"
@@ -332,7 +429,7 @@ def main() -> int:
         agent_name = AGENT_NAMES.get(task.agent, task.agent)
         status_name = TASK_STATUS_NAMES[state["task_statuses"][task.task_id]]
         print(f"{index}. {agent_name}：{status_name}")
-    print("\n规划器执行判断：")
+    print("\n执行判断：")
     for index, review in enumerate(state["reviews"], start=1):
         action_name = ACTION_NAMES[review.action]
         print(f"{index}. 第 {index} 批：{action_name}——{review.reason}")

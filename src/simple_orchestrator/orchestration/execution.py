@@ -1,8 +1,4 @@
-"""LangGraph main graph: dynamic task fan-out, batch review and safe routing.
-
-The three agent nodes are transport adapters. They call today's local Ports; an
-HTTP/JSON-RPC adapter can replace a Port without changing this graph's State.
-"""
+"""Shared task execution, dependency checks and deterministic result handling."""
 
 from __future__ import annotations
 
@@ -13,9 +9,10 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from .models import (
+from ..models import (
     AgentResult,
     BatchReviewDecision,
+    HandlingMode,
     IntentAnalysis,
     IntentType,
     NextAction,
@@ -25,15 +22,14 @@ from .models import (
     TaskStatus,
     WorkflowStatus,
 )
-from .planner import PlanningError
-from .ports import (
+from ..errors import PlanningError
+from ..ports import (
     DeviceManagerPort,
-    GraphPlannerPort,
     KnowledgeAgentPort,
-    PlannerPort,
     UsrpAgentPort,
 )
-from .remote import JsonRpcAgentAdapter
+from ..remote import JsonRpcAgentAdapter
+from ..task_messages import invocation_metadata, make_agent_request, make_knowledge_request
 
 
 @dataclass(frozen=True)
@@ -116,6 +112,8 @@ def append_reviews(
 class MainState(TypedDict, total=False):
     request_id: str
     user_request: str
+    handling_mode: HandlingMode
+    clarification_questions: list[str]
     intent: IntentAnalysis
     precomputed_plan: Any
     plan_status: PlanStatus
@@ -140,24 +138,23 @@ class BranchState(TypedDict):
     attempt: int
     plan_version: int
     dependency_results: dict[str, AgentResult]
+    single_task: bool
 
 
-class GraphOrchestrator:
-    """Build and run one stateless, synchronous main graph per request."""
+class WorkflowExecutor:
+    """Execute supplied tasks without intent recognition or model planning."""
 
     def __init__(
         self,
-        planner: GraphPlannerPort | PlannerPort,
         knowledge: KnowledgeAgentPort,
         device_manager: DeviceManagerPort,
         usrp: UsrpAgentPort,
         max_retries: int = 1,
-        max_replans: int = 1,
+        max_replans: int = 0,
         allow_remote_physical_execution: bool = False,
     ) -> None:
         if max_retries not in (0, 1) or max_replans not in (0, 1):
             raise ValueError("重试和重规划次数只能设置为 0 或 1")
-        self.planner = planner
         self.knowledge = knowledge
         self.device_manager = device_manager
         self.usrp = usrp
@@ -170,7 +167,8 @@ class GraphOrchestrator:
             usrp.skill_reader = knowledge
         self.graph = self._build_graph()
 
-    def run(self, user_request: str, *, request_id: str | None = None) -> MainState:
+    @staticmethod
+    def initial_state(user_request: str, request_id: str | None = None) -> MainState:
         initial: MainState = {
             "request_id": request_id or f"req-{uuid4().hex}",
             "user_request": user_request,
@@ -185,12 +183,24 @@ class GraphOrchestrator:
             "final_answer": "",
             "error": None,
         }
+        return initial
+
+    def run(
+        self, user_request: str, *, intent: IntentAnalysis,
+        tasks: list[Task], request_id: str | None = None,
+    ) -> MainState:
+        initial = self.initial_state(user_request, request_id)
+        initial["intent"] = intent
+        initial.update(self._load_tasks(user_request, intent, tasks))
         return self.graph.invoke(initial, {"recursion_limit": 100})
 
     def _build_graph(self):
+        graph = self._execution_graph()
+        graph.add_edge(START, "dispatch")
+        return graph.compile()
+
+    def _execution_graph(self):
         graph = StateGraph(MainState)
-        graph.add_node("analyze_intent", self._analyze_intent)
-        graph.add_node("create_plan", self._create_plan)
         graph.add_node("dispatch", self._dispatch)
         graph.add_node("knowledge", self._knowledge)
         graph.add_node("device_manager", self._device_manager)
@@ -198,52 +208,28 @@ class GraphOrchestrator:
         graph.add_node("review_batch", self._review_batch)
         graph.add_node("apply_review", self._apply_review)
         graph.add_node("finalize", self._finalize)
-        graph.add_edge(START, "analyze_intent")
-        graph.add_edge("analyze_intent", "create_plan")
-        graph.add_conditional_edges("create_plan", self._route_plan)
         graph.add_conditional_edges("dispatch", self._route_dispatch)
         for agent in ("knowledge", "device_manager", "usrp"):
             graph.add_edge(agent, "review_batch")
         graph.add_edge("review_batch", "apply_review")
         graph.add_conditional_edges("apply_review", self._route_after_review)
         graph.add_edge("finalize", END)
-        return graph.compile()
+        return graph
 
-    def _analyze_intent(self, state: MainState) -> dict[str, Any]:
-        analyze = getattr(self.planner, "analyze_intent", None)
-        if analyze is not None:
-            return {"intent": analyze(state["user_request"])}
-        plan = self.planner.create_plan(state["user_request"])
-        return {"intent": plan.intent, "precomputed_plan": plan}
-
-    def _create_plan(self, state: MainState) -> dict[str, Any]:
-        plan_from_intent = getattr(self.planner, "create_plan_from_intent", None)
-        if plan_from_intent is not None:
-            plan = plan_from_intent(state["user_request"], state["intent"])
-        else:
-            plan = state["precomputed_plan"]
-        updates: dict[str, Any] = {"plan_status": plan.status, "intent": plan.intent}
-        if plan.status is PlanStatus.NEEDS_CLARIFICATION:
-            updates.update(
-                status=WorkflowStatus.NEEDS_CLARIFICATION,
-                error=plan.reason or "missing required parameters",
-                final_answer="执行前需要补充信息：" + "；".join(plan.clarification_questions),
-            )
-            return updates
-        if plan.status is PlanStatus.UNSUPPORTED:
-            updates.update(
-                status=WorkflowStatus.UNSUPPORTED,
-                error=plan.reason,
-                final_answer=f"当前智能体无法处理该请求：{plan.reason}",
-            )
-            return updates
-        tasks = self._prepare_tasks(plan.tasks, plan.intent)
-        if any(self._is_physical_usrp(task) for task in tasks) and "usrp" not in state["user_request"].lower():
+    def _load_tasks(
+        self, user_request: str, intent: IntentAnalysis, tasks: list[Task],
+    ) -> dict[str, Any]:
+        if intent.needs_clarification or intent.intent_type is IntentType.UNSUPPORTED:
+            raise PlanningError("意图尚未就绪，不能执行任务")
+        prepared = self._prepare_tasks(tasks, intent)
+        if any(self._is_physical_usrp(task) for task in prepared) and "usrp" not in user_request.lower():
             raise PlanningError("用户未明确指定 USRP，不允许硬件执行")
-        self._validate_tasks(tasks)
-        updates["plan_history"] = [PlanSnapshot(1, tuple(tasks))]
-        updates["task_statuses"] = {task.task_id: TaskStatus.PENDING for task in tasks}
-        return updates
+        self._validate_tasks(prepared)
+        return {
+            "plan_status": PlanStatus.READY,
+            "plan_history": [PlanSnapshot(1, tuple(prepared))],
+            "task_statuses": {task.task_id: TaskStatus.PENDING for task in prepared},
+        }
 
     @staticmethod
     def _fresh_id(prefix: str, used: set[str]) -> str:
@@ -296,7 +282,7 @@ class GraphOrchestrator:
             device_tasks = [
                 candidate for candidate in reusable
                 if candidate.agent == "device_manager"
-                and candidate.capability == "device.select"
+                and candidate.capability in {"device.list", "device.inspect"}
                 and candidate.inputs.get("required_capability") == task.capability
             ]
             skill_id = skill_tasks[0].task_id if skill_tasks else self._fresh_id(f"{task.task_id}_skill", used)
@@ -313,11 +299,11 @@ class GraphOrchestrator:
                 reusable.append(skill)
             if not device_tasks:
                 device = TaskSpec(
-                        device_id, "device_manager", "选择可用 USRP 设备",
-                        capability="device.select",
+                        device_id, "device_manager", "查询可用 USRP 设备及在线状态",
+                        capability="device.list",
                         inputs={"target_type": "usrp", "required_capability": task.capability},
-                        expected_output=("device_id", "selected_device"),
-                        completion_criteria=("选中在线且能力匹配的 USRP",),
+                        expected_output=("network_devices",),
+                        completion_criteria=("返回匹配设备及其在线状态",),
                     )
                 prepared.append(device)
                 reusable.append(device)
@@ -340,6 +326,8 @@ class GraphOrchestrator:
         for task in tasks:
             if task.agent not in {"knowledge", "device_manager", "usrp"}:
                 raise PlanningError(f"未知执行目标：{task.agent}")
+            if task.agent == "device_manager" and task.capability not in {"", "device.list", "device.inspect"}:
+                raise PlanningError("网络监管智能体只允许查询设备清单和状态")
             if task.task_id in known:
                 raise PlanningError(f"任务 ID 重复：{task.task_id}")
             missing = set(task.dependencies) - known
@@ -404,6 +392,7 @@ class GraphOrchestrator:
                 "attempt": len(state["results"].get(task_id, [])) + 1,
                 "plan_version": state["active_plan_version"],
                 "dependency_results": dependency_results,
+                "single_task": len(task_by_id) == 1,
             }
             sends.append(Send(task.agent, branch))
         return sends
@@ -427,10 +416,10 @@ class GraphOrchestrator:
         }
 
     def _knowledge(self, branch: BranchState) -> dict[str, Any]:
-        return self._invoke_branch(branch, self.knowledge.invoke)
+        return self._invoke_branch(branch, self.knowledge.invoke, natural_language=True)
 
     def _device_manager(self, branch: BranchState) -> dict[str, Any]:
-        return self._invoke_branch(branch, self.device_manager.invoke)
+        return self._invoke_branch(branch, self.device_manager.invoke, natural_language=True)
 
     def _usrp(self, branch: BranchState) -> dict[str, Any]:
         if branch["task"].capability == "knowledge.explain":
@@ -451,31 +440,43 @@ class GraphOrchestrator:
         ]
         devices = [
             result.data for result in branch["dependency_results"].values()
-            if "device_id" in result.data
+            if "network_devices" in result.data
         ]
         if not skills or not devices:
             result = AgentResult(ResultStatus.FAILED, "USRP 未执行：缺少 Skill 或设备", error="missing_preflight")
             return self._branch_update(branch, result)
         skill_ref = skills[0]
-        selected = devices[0]
         skill_valid = all(
             isinstance(skill_ref.get(key), str) and skill_ref[key]
             for key in ("skill_id", "version", "sha256")
         )
-        device_valid = (
-            selected.get("selection") == "selected"
-            and isinstance(selected.get("device_id"), str)
-            and bool(selected["device_id"])
-        )
-        device_details = selected.get("selected_device")
-        device_valid = (
-            device_valid
-            and isinstance(device_details, Mapping)
-            and device_details.get("device_id") == selected.get("device_id")
-            and device_details.get("status") == "online"
-            and branch["task"].capability in device_details.get("capabilities", [])
-        )
-        if not skill_valid or not device_valid:
+        # The orchestrator chooses from read-only query results; DeviceManager
+        # neither selects nor reserves hardware.
+        device_details = None
+        for query_result in devices:
+            candidates = query_result.get("network_devices")
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                candidate_id = candidate.get("device_id")
+                requested_id = branch["task"].inputs.get("device_id")
+                capabilities = candidate.get("capabilities")
+                if capabilities is None:
+                    capabilities = getattr(self.device_manager, "device_capabilities", {}).get(candidate_id, ())
+                if (
+                    isinstance(candidate_id, str) and candidate_id
+                    and (not requested_id or requested_id == candidate_id)
+                    and candidate.get("device_type") == "usrp"
+                    and candidate.get("status") == "online"
+                    and branch["task"].capability in capabilities
+                ):
+                    device_details = dict(candidate)
+                    break
+            if device_details is not None:
+                break
+        if not skill_valid or device_details is None:
             result = AgentResult(
                 ResultStatus.FAILED,
                 "USRP 未执行：Skill 索引或设备能力校验失败",
@@ -483,12 +484,34 @@ class GraphOrchestrator:
             )
             return self._branch_update(branch, result)
         context["skill_ref"] = skill_ref
-        context["selected_device"] = selected
+        context["selected_device"] = {
+            "device_id": device_details["device_id"], "selected_device": device_details,
+        }
         return self._invoke_branch(branch, self.usrp.execute, context)
 
-    def _invoke_branch(self, branch: BranchState, invoke, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _invoke_branch(
+        self, branch: BranchState, invoke, context: dict[str, Any] | None = None, *,
+        natural_language: bool = False,
+    ) -> dict[str, Any]:
         try:
-            result = invoke(context or self._request_context(branch))
+            request_context = context or self._request_context(branch)
+            if natural_language:
+                request = (
+                    make_knowledge_request(
+                        request_context,
+                        use_user_question=(
+                            branch["single_task"]
+                            and branch["task"].capability != "knowledge.lookup_skill"
+                        ),
+                    )
+                    if branch["task"].agent == "knowledge" else make_agent_request(request_context)
+                )
+                result = invoke(
+                    request,
+                    metadata=invocation_metadata(request_context),
+                )
+            else:
+                result = invoke(request_context)
         except Exception as exc:
             # A remote USRP may have acted before its response was lost.
             status = (
@@ -524,9 +547,13 @@ class GraphOrchestrator:
             and (
                 state["results"][task_id][-1].result.error
                 in {"no device available", "no_device_available"}
-                or state["results"][task_id][-1].result.data.get("selection") == "unavailable"
+                or (
+                    state["intent"].intent_type is IntentType.HARDWARE_EXECUTION
+                    and statuses[task_id] is TaskStatus.SUCCEEDED
+                    and state["results"][task_id][-1].result.data.get("network_devices") == []
+                )
             )
-            for task_id in failed
+            for task_id in batch
         )
         rejected = any(statuses[task_id] is TaskStatus.REJECTED for task_id in failed)
         invalid_skill = any(
@@ -571,6 +598,7 @@ class GraphOrchestrator:
                     "needs_clarification": state["intent"].needs_clarification,
                     "evidence": state["intent"].evidence,
                     "reason": state["intent"].reason,
+                    "handling_mode": state["intent"].handling_mode.value,
                 },
                 "plan_version": state["active_plan_version"],
                 "current_plan": [asdict(task) for task in self._active_tasks(state)],
@@ -598,19 +626,21 @@ class GraphOrchestrator:
                     if status is TaskStatus.SUCCEEDED and task_id in state["results"]
                 },
             }
-            review_batch = getattr(self.planner, "review_batch", None)
-            if review_batch is not None:
-                decision = review_batch(context)
-            elif retryable:
-                decision = BatchReviewDecision(NextAction.RETRY, "重试失败任务", retryable)
-            elif failed:
-                decision = BatchReviewDecision(NextAction.STOP, "任务失败且无重试机会")
-            else:
-                decision = BatchReviewDecision(
-                    NextAction.CONTINUE if pending else NextAction.COMPLETE,
-                    "本批任务已完成",
-                )
+            decision = self._decide_batch(context)
         return {"batch_decision": decision, "reviews": [decision]}
+
+    def _decide_batch(self, context: dict[str, Any]) -> BatchReviewDecision:
+        """Fixed execution retries failures but never invents a new workflow."""
+        if context["retryable_task_ids"]:
+            return BatchReviewDecision(
+                NextAction.RETRY, "重试失败任务", context["retryable_task_ids"]
+            )
+        if context["failed_task_ids"]:
+            return BatchReviewDecision(NextAction.STOP, "任务失败且无重试机会")
+        return BatchReviewDecision(
+            NextAction.CONTINUE if context["has_pending_tasks"] else NextAction.COMPLETE,
+            "本批任务已完成",
+        )
 
     def _apply_review(self, state: MainState) -> dict[str, Any]:
         decision = state["batch_decision"]
@@ -651,36 +681,7 @@ class GraphOrchestrator:
         return self._stop(state, decision.reason)
 
     def _apply_replan(self, state: MainState, revised: list[Task]) -> dict[str, Any]:
-        used = set(state["task_statuses"])
-        successful = [
-            task for task in self._active_tasks(state)
-            if state["task_statuses"][task.task_id] is TaskStatus.SUCCEEDED
-        ]
-        if any(task.task_id in used for task in revised):
-            raise PlanningError("新计划使用了已有任务 ID")
-        # Re-check physical preflight for any newly planned USRP task.
-        new_specs = self._prepare_tasks(
-            revised, state["intent"], reserved_ids=used,
-            prior_success_tasks=successful,
-        )
-        if any(self._is_physical_usrp(task) for task in new_specs) and "usrp" not in state["user_request"].lower():
-            raise PlanningError("用户未明确指定 USRP，不允许硬件执行")
-        self._validate_tasks(new_specs, {task.task_id for task in successful})
-        next_version = state["active_plan_version"] + 1
-        snapshot = PlanSnapshot(next_version, tuple([*successful, *new_specs]))
-        skipped = {
-            task.task_id: TaskStatus.SKIPPED for task in self._active_tasks(state)
-            if state["task_statuses"][task.task_id] is TaskStatus.PENDING
-        }
-        return {
-            "plan_history": [*state["plan_history"], snapshot],
-            "active_plan_version": next_version,
-            "replan_count": state["replan_count"] + 1,
-            "task_statuses": {
-                **skipped,
-                **{task.task_id: TaskStatus.PENDING for task in new_specs},
-            },
-        }
+        raise PlanningError("固定流程不支持动态重规划")
 
     @staticmethod
     def _stop(state: MainState, reason: str) -> dict[str, Any]:

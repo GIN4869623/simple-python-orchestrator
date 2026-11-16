@@ -102,12 +102,10 @@ class PlanValidator:
                 continue
             if (
                 dependency.agent == "device_manager"
-                and dependency.capability == "device.select"
+                and dependency.capability in {"device.list", "device.inspect"}
             ):
-                expected_reference = f"{dependency.task_id}.device_id"
-                device_reference = task.inputs.get(
-                    "device_id_from", task.inputs.get("device_id")
-                )
+                expected_reference = f"{dependency.task_id}.network_devices"
+                device_reference = task.inputs.get("device_candidates_from")
                 if device_reference != expected_reference:
                     raise PlanValidationError(
                         f"USRP 任务 {task.task_id} 必须引用 "
@@ -117,5 +115,5 @@ class PlanValidator:
             pending.extend(dependency.dependencies)
 
         raise PlanValidationError(
-            f"USRP 任务 {task.task_id} 必须依赖 device.select 任务"
+            f"USRP 任务 {task.task_id} 必须依赖设备查询任务"
         )

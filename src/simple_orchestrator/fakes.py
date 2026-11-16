@@ -38,7 +38,9 @@ class FakeKnowledgePort:
             "sha256": sha256(content.encode("utf-8")).hexdigest(),
         }
 
-    def invoke(self, request: Mapping[str, Any]) -> AgentResult:
+    def invoke(
+        self, request: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None,
+    ) -> AgentResult:
         self.call_count += 1
         if self.should_fail or self.outcome is ResultStatus.FAILED:
             return AgentResult(
@@ -59,8 +61,7 @@ class FakeKnowledgePort:
                 "知识智能体无法确认查询结果",
                 {"reason": "fake knowledge result unknown"},
             )
-        current_task = request.get("current_task", {})
-        if isinstance(current_task, Mapping) and current_task.get("capability") == "knowledge.lookup_skill":
+        if (metadata or {}).get("capability") == "knowledge.lookup_skill":
             content = self._skill_content()
             return AgentResult(
                 ResultStatus.SUCCEEDED,
@@ -80,69 +81,54 @@ class FakeKnowledgePort:
 
 @dataclass
 class FakeDeviceManagerPort:
-    selection: str = "selected"
+    available: bool = True
     device_id: str = "USRP-01"
     outcome: ResultStatus | None = None
     call_count: int = 0
 
-    def invoke(self, request: Mapping[str, Any]) -> AgentResult:
+    @property
+    def device_capabilities(self) -> dict[str, tuple[str, ...]]:
+        """Local inventory for preflight checks, separate from device responses."""
+        return {
+            self.device_id: (
+                "usrp.configure", "usrp.transmit", "usrp.receive",
+                "signal_transmit", "signal_receive",
+            ),
+        }
+
+    def invoke(
+        self, request: Mapping[str, Any], *, metadata: Mapping[str, Any] | None = None,
+    ) -> AgentResult:
         self.call_count += 1
-        current_task = request.get("current_task", {})
-        capability = (
-            current_task.get("capability")
-            if isinstance(current_task, Mapping)
-            else None
-        )
         if self.outcome is ResultStatus.REJECTED:
             return AgentResult(
                 ResultStatus.REJECTED,
-                "设备管理智能体拒绝本次模拟设备请求",
-                {"selection": "rejected"},
+                "网络监管智能体拒绝本次模拟设备请求",
+                {},
                 error="device request rejected",
             )
-        if self.outcome is ResultStatus.FAILED or self.selection == "unavailable":
+        if self.outcome is ResultStatus.FAILED or not self.available:
             return AgentResult(
                 ResultStatus.FAILED,
-                "设备选择失败：当前没有可用硬件",
-                {"selection": "unavailable"},
+                "设备查询未取得可用设备",
+                {"network_devices": []},
                 error="no device available",
             )
-        if self.outcome is ResultStatus.UNKNOWN or self.selection == "unknown":
+        if self.outcome is ResultStatus.UNKNOWN:
             return AgentResult(
                 ResultStatus.UNKNOWN,
                 "无法从网络资源信息中确认可用设备",
-                {"selection": "unknown"},
+                {},
             )
-        selected_device = {
+        device = {
             "device_id": self.device_id,
             "device_type": "usrp",
             "status": "online",
-            "capabilities": [
-                "usrp.configure",
-                "usrp.transmit",
-                "usrp.receive",
-                "signal_transmit",
-                "signal_receive",
-            ],
         }
-        if capability != "device.select":
-            return AgentResult(
-                ResultStatus.SUCCEEDED,
-                "已获取模拟设备清单和状态",
-                {
-                    "selection": "not_requested",
-                    "network_devices": [selected_device],
-                },
-            )
         return AgentResult(
             ResultStatus.SUCCEEDED,
-            f"已获取设备信息并选择模拟 USRP：{self.device_id}",
-            {
-                "selection": "selected",
-                "device_id": self.device_id,
-                "network_devices": [selected_device],
-                "selected_device": selected_device,
-            },
+            "已获取模拟设备清单和状态",
+            {"network_devices": [device]},
         )
 
 

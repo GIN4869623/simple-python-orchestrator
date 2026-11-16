@@ -41,6 +41,12 @@ class IntentType(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+class HandlingMode(str, Enum):
+    DIRECT = "direct"
+    FIXED_WORKFLOW = "fixed_workflow"
+    ORCHESTRATED = "orchestrated"
+
+
 class ExecutionMode(str, Enum):
     INFORMATIONAL = "informational"
     READ_ONLY = "read_only"
@@ -93,6 +99,8 @@ class IntentAnalysis:
     needs_clarification: bool = False
     evidence: str = ""
     reason: str = ""
+    # Legacy callers without a routing decision retain dynamic planning.
+    handling_mode: HandlingMode = HandlingMode.ORCHESTRATED
 
 
 @dataclass(frozen=True)

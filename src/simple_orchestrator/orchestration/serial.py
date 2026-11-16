@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import (
+from ..task_messages import invocation_metadata, make_agent_request, make_knowledge_request
+
+from ..models import (
     AgentResult,
     NextAction,
     PlanStatus,
@@ -14,7 +16,7 @@ from .models import (
     WorkflowState,
     WorkflowStatus,
 )
-from .ports import (
+from ..ports import (
     DeviceManagerPort,
     KnowledgeAgentPort,
     PlannerPort,
@@ -164,9 +166,13 @@ class Orchestrator:
             },
         }
         if task.agent == "knowledge":
-            return self.knowledge.invoke(context)
+            request = make_knowledge_request(
+                context,
+                use_user_question=len(state.tasks) == 1 and task.capability != "knowledge.lookup_skill",
+            )
+            return self.knowledge.invoke(request, metadata=invocation_metadata(context))
         if task.agent == "device_manager":
-            return self.device_manager.invoke(context)
+            return self.device_manager.invoke(make_agent_request(context), metadata=invocation_metadata(context))
         if task.agent == "usrp":
             return self.usrp.execute(context)
         return AgentResult(

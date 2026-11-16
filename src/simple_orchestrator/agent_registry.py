@@ -81,23 +81,17 @@ def build_default_registry() -> AgentRegistry:
             ),
             AgentProfile(
                 agent_id="device_manager",
-                name="设备管理智能体",
-                description="查询设备清单、在线状态和能力，并选择可用设备。",
+                name="网络监管智能体",
+                description="只读查询网络中的设备清单和在线状态。",
                 capabilities=(
                     "device.list",
                     "device.inspect",
-                    "device.select",
-                    "device.reserve",
                 ),
                 supported_intents=("device_query", "hardware_execution"),
                 supported_targets=("*",),
-                side_effect_level="resource_management",
-                exclusions=("法规审批", "通信原理回答", "射频发射或接收"),
-                output_contract=(
-                    "network_devices",
-                    "selected_device",
-                    "device_id",
-                ),
+                side_effect_level="none",
+                exclusions=("法规审批", "通信原理回答", "设备选择或占用", "真实硬件操作"),
+                output_contract=("network_devices",),
             ),
             AgentProfile(
                 agent_id="usrp",
@@ -117,7 +111,7 @@ def build_default_registry() -> AgentRegistry:
                 required_inputs=(),
                 preconditions=(
                     "知识查询必须只读；物理操作必须由用户明确要求",
-                    "物理操作前设备管理智能体已确认设备在线且能力匹配",
+                    "物理操作前网络监管智能体已确认设备在线且能力匹配",
                 ),
                 exclusions=(
                     "软件仿真",
