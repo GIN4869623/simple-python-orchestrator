@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Annotated, Any, Mapping, TypedDict
+from typing import Annotated, Any, Callable, Mapping, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -152,12 +152,14 @@ class WorkflowExecutor:
         max_retries: int = 1,
         max_replans: int = 0,
         allow_remote_physical_execution: bool = False,
+        ris: Callable[[Mapping[str, Any]], AgentResult] | None = None,
     ) -> None:
         if max_retries not in (0, 1) or max_replans not in (0, 1):
             raise ValueError("重试和重规划次数只能设置为 0 或 1")
         self.knowledge = knowledge
         self.device_manager = device_manager
         self.usrp = usrp
+        self.ris = ris
         self.max_retries = max_retries
         self.max_replans = max_replans
         self.allow_remote_physical_execution = allow_remote_physical_execution
@@ -205,11 +207,12 @@ class WorkflowExecutor:
         graph.add_node("knowledge", self._knowledge)
         graph.add_node("device_manager", self._device_manager)
         graph.add_node("usrp", self._usrp)
+        graph.add_node("ris", self._ris)
         graph.add_node("review_batch", self._review_batch)
         graph.add_node("apply_review", self._apply_review)
         graph.add_node("finalize", self._finalize)
         graph.add_conditional_edges("dispatch", self._route_dispatch)
-        for agent in ("knowledge", "device_manager", "usrp"):
+        for agent in ("knowledge", "device_manager", "usrp", "ris"):
             graph.add_edge(agent, "review_batch")
         graph.add_edge("review_batch", "apply_review")
         graph.add_conditional_edges("apply_review", self._route_after_review)
@@ -250,11 +253,13 @@ class WorkflowExecutor:
         specs = [TaskSpec.from_task(task) for task in tasks]
         if intent.intent_type is IntentType.DEVICE_QUERY and (
             len(specs) != 1
-            or specs[0].agent != "device_manager"
-            or specs[0].capability not in {"device.list", "device.inspect"}
+            or specs[0].agent not in ({"ris"} if intent.target_type == "ris" else {"device_manager"})
+            or specs[0].capability not in ({"device.list", "device.inspect", "ris.chat"} if intent.target_type == "ris" else {"device.list", "device.inspect"})
         ):
             raise PlanningError("设备查询只能由 DeviceManager 独立执行")
         for task in specs:
+            if task.agent == "ris" and intent.target_type != "ris":
+                raise PlanningError("RIS 任务必须属于明确的 RIS 意图")
             if task.agent != "usrp":
                 continue
             if task.capability == "knowledge.explain":
@@ -324,8 +329,10 @@ class WorkflowExecutor:
             raise PlanningError("计划不能为空")
         known = set(prior_success or ())
         for task in tasks:
-            if task.agent not in {"knowledge", "device_manager", "usrp"}:
+            if task.agent not in {"knowledge", "device_manager", "usrp", "ris"}:
                 raise PlanningError(f"未知执行目标：{task.agent}")
+            if task.agent == "ris" and task.capability not in {"ris.chat", "knowledge.explain", "device.list", "device.inspect"}:
+                raise PlanningError("RIS 任务使用了未接入的能力")
             if task.agent == "device_manager" and task.capability not in {"", "device.list", "device.inspect"}:
                 raise PlanningError("网络监管智能体只允许查询设备清单和状态")
             if task.task_id in known:
@@ -421,6 +428,14 @@ class WorkflowExecutor:
     def _device_manager(self, branch: BranchState) -> dict[str, Any]:
         return self._invoke_branch(branch, self.device_manager.invoke, natural_language=True)
 
+    def _ris(self, branch: BranchState) -> dict[str, Any]:
+        if self.ris is None:
+            return self._branch_update(branch, AgentResult(
+                ResultStatus.REJECTED, "RIS 业务接口未配置", error="ris_not_configured"))
+        context = self._request_context(branch)
+        context["single_task"] = branch["single_task"]
+        return self._invoke_branch(branch, self.ris, context)
+
     def _usrp(self, branch: BranchState) -> dict[str, Any]:
         if branch["task"].capability == "knowledge.explain":
             return self._invoke_branch(branch, self.usrp.invoke)
@@ -504,7 +519,9 @@ class WorkflowExecutor:
                             and branch["task"].capability != "knowledge.lookup_skill"
                         ),
                     )
-                    if branch["task"].agent == "knowledge" else make_agent_request(request_context)
+                    if branch["task"].agent == "knowledge" else make_agent_request(
+                        request_context, include_user_request=branch["task"].agent != "device_manager",
+                    )
                 )
                 result = invoke(
                     request,
@@ -566,11 +583,13 @@ class WorkflowExecutor:
             and statuses[task_id] is TaskStatus.UNKNOWN
             for task_id in failed
         )
-        if no_device or rejected or invalid_skill or physical_unknown:
+        ris_unknown = any(task_by_id[task_id].agent == "ris" and statuses[task_id] is TaskStatus.UNKNOWN for task_id in failed)
+        if no_device or rejected or invalid_skill or physical_unknown or ris_unknown:
             reason = (
                 "没有可用设备" if no_device
                 else "任务被明确拒绝" if rejected
                 else "可信 Skill 或设备前置校验失败" if invalid_skill
+                else "RIS 回复未完整收到，停止重复调用" if ris_unknown
                 else "USRP 结果未知，禁止盲目重试"
             )
             decision = BatchReviewDecision(NextAction.STOP, reason)

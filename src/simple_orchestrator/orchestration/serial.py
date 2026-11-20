@@ -56,6 +56,11 @@ class Orchestrator:
         )
         plan = self.planner.create_plan(user_request)
         state.intent = plan.intent
+        if any(task.agent == "ris" for task in plan.tasks):
+            state.status = WorkflowStatus.UNSUPPORTED
+            state.error = "旧版串行入口未配置 RIS，请使用意图识别或编排服务"
+            state.final_answer = state.error
+            return state
         state.tasks = plan.tasks
         if plan.status is PlanStatus.NEEDS_CLARIFICATION:
             state.status = WorkflowStatus.NEEDS_CLARIFICATION

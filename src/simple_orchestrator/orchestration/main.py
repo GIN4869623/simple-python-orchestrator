@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from functools import partial
 
 from ..agent_logging import AgentMessageLog, LoggedFakeAgent
 from ..config import load_dotenv
@@ -13,9 +14,10 @@ from .graph import GraphOrchestrator
 from .execution import WorkflowExecutor
 from ..intent.agent import FixedIntentAgent, OllamaIntentAgent
 from ..intent.client import IntentHttpClient
-from ..ollama import OllamaClient
+from ..model_client import add_model_arguments, make_model_client
 from .router import RequestRouter
 from ..knowledge_http import DEFAULT_KNOWLEDGE_API_URL, KnowledgeHttpAdapter
+from ..network_chat import NetworkChatAdapter
 from ..models import (
     HandlingMode,
     IntentAnalysis,
@@ -27,7 +29,7 @@ from ..models import (
     WorkflowStatus,
 )
 from .planner import FixedPlanner, OllamaPlanner, PlanningError
-from ..remote import JsonRpcAgentAdapter
+from ..remote import JsonRpcAgentAdapter, call_ris_chat
 from ..tcp_transport import TcpJsonRpcAgentAdapter
 
 
@@ -35,6 +37,7 @@ AGENT_NAMES = {
     "knowledge": "知识智能体",
     "device_manager": "网络监管智能体",
     "usrp": "USRP 硬件智能体",
+    "ris": "RIS 智能体",
 }
 
 TASK_STATUS_NAMES = {
@@ -112,6 +115,7 @@ def describe_intent(intent: IntentAnalysis) -> str:
 def build_parser() -> argparse.ArgumentParser:
     load_dotenv()
     parser = argparse.ArgumentParser(description="运行最小编排智能体")
+    add_model_arguments(parser)
     parser.add_argument(
         "request",
         nargs="?",
@@ -165,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="通过静态配置的 HTTP(S) 或 TCP 地址调用远程智能体",
     )
+    parser.add_argument("--ris-chat-url", default=os.getenv("RIS_AGENT_CHAT_URL", "http://192.168.1.132:8000/api/chat/stream"))
+    parser.add_argument("--ris-timeout", type=float, default=float(os.getenv("RIS_AGENT_TIMEOUT", "180")))
+    parser.add_argument("--network-chat-url", default=os.getenv("NETWORK_SUPERVISION_CHAT_URL", ""))
+    parser.add_argument("--network-chat-timeout", type=float, default=float(os.getenv("NETWORK_SUPERVISION_CHAT_TIMEOUT", "120")))
     parser.add_argument("--knowledge-rpc-url", default=os.getenv("KNOWLEDGE_RPC_URL", ""))
     parser.add_argument(
         "--knowledge-api-url", nargs="?", const=DEFAULT_KNOWLEDGE_API_URL,
@@ -261,18 +269,25 @@ def choose_fake_outcome(configured_outcome: str | None) -> ResultStatus:
         print("无效序号，请输入 1、2、3 或 4。")
 
 
-def build_orchestrator(
-    args: argparse.Namespace, parser: argparse.ArgumentParser,
-) -> tuple[RequestRouter, ResultStatus | None]:
-    """Build the same runtime for the CLI and HTTP entry points."""
-
+def build_executor(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, *,
+    knowledge_sender: str = "编排智能体",
+) -> tuple[WorkflowExecutor, ResultStatus | None]:
+    """Build configured business adapters without constructing a planner."""
     message_log = AgentMessageLog(args.agent_log_path)
+    network = None
+    if args.network_chat_url:
+        try:
+            network = NetworkChatAdapter(args.network_chat_url, timeout=args.network_chat_timeout,
+                                         sender=knowledge_sender, message_log=message_log)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.remote_agents:
         if args.parameter_policy != ParameterPolicy.STRICT.value:
             parser.error("远程硬件模式必须使用 --parameter-policy strict")
         if args.fake_outcome is not None:
             parser.error("远程智能体模式不能同时指定 --fake-outcome")
-        if not all((args.knowledge_api_url or args.knowledge_rpc_url, args.device_rpc_url, args.usrp_rpc_url)):
+        if not all((args.knowledge_api_url or args.knowledge_rpc_url, network or args.device_rpc_url, args.usrp_rpc_url)):
             parser.error("远程智能体模式必须配置 Knowledge、DeviceManager 和 USRP 地址")
         fake_outcome = None
         token = os.getenv("ORCHESTRATOR_RPC_TOKEN")
@@ -283,46 +298,56 @@ def build_orchestrator(
                                 message_log=message_log if agent_id != "usrp" else None)
 
         knowledge = (
-            KnowledgeHttpAdapter(args.knowledge_api_url, timeout=args.rpc_timeout,
-                                 api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log)
+            KnowledgeHttpAdapter(
+                args.knowledge_api_url, timeout=args.rpc_timeout, sender=knowledge_sender,
+                api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log,
+            )
             if args.knowledge_api_url else make_adapter(args.knowledge_rpc_url, "knowledge")
         )
-        device_manager = make_adapter(args.device_rpc_url, "device_manager")
+        device_manager = network or make_adapter(args.device_rpc_url, "device_manager")
         usrp = make_adapter(args.usrp_rpc_url, "usrp")
     else:
         configured_fake_outcome = args.fake_outcome
-        if configured_fake_outcome is None and args.knowledge_api_url:
+        if configured_fake_outcome is None and (args.knowledge_api_url or network):
             configured_fake_outcome = ResultStatus.SUCCEEDED.value
         fake_outcome = choose_fake_outcome(configured_fake_outcome)
         knowledge = (
-            KnowledgeHttpAdapter(args.knowledge_api_url, timeout=args.rpc_timeout,
-                                 api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log)
+            KnowledgeHttpAdapter(
+                args.knowledge_api_url, timeout=args.rpc_timeout, sender=knowledge_sender,
+                api_key=os.getenv("KNOWLEDGE_API_KEY"), message_log=message_log,
+            )
             if args.knowledge_api_url else
             LoggedFakeAgent(FakeKnowledgePort(outcome=fake_outcome), "knowledge", message_log)
         )
-        device_manager = FakeDeviceManagerPort(
-            device_id=args.device_id,
-            outcome=fake_outcome,
+        device_manager = network or LoggedFakeAgent(
+            FakeDeviceManagerPort(device_id=args.device_id, outcome=fake_outcome),
+            "device_manager", message_log,
         )
         usrp = FakeUsrpAgent(outcome=fake_outcome)
-        device_manager = LoggedFakeAgent(device_manager, "device_manager", message_log)
+    return WorkflowExecutor(
+        knowledge=knowledge, device_manager=device_manager, usrp=usrp,
+        ris=partial(call_ris_chat, endpoint=args.ris_chat_url, timeout=args.ris_timeout, message_log=message_log) if args.ris_chat_url else None,
+        max_retries=args.max_retries,
+    ), fake_outcome
+
+
+def build_orchestrator(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> tuple[RequestRouter, ResultStatus | None]:
+    """Build the same runtime for the CLI and HTTP entry points."""
+
+    executor, fake_outcome = build_executor(args, parser)
+    knowledge, device_manager, usrp = executor.knowledge, executor.device_manager, executor.usrp
     parameter_policy = ParameterPolicy(args.parameter_policy)
 
     if args.planner == "ollama":
-        if not args.ollama_model:
-            parser.error(
-                "使用 Ollama Planner 时必须设置 OLLAMA_MODEL 或 --ollama-model"
-            )
-        model_options = {
-            "model": args.ollama_model,
-            "base_url": args.ollama_url,
-            "timeout": args.ollama_timeout,
-            "temperature": args.ollama_temperature,
-            "log_path": args.ollama_log_path,
-        }
-        client = OllamaClient(**model_options)
+        try:
+            client = make_model_client(args, purpose="orchestration")
+        except PlanningError as exc:
+            parser.error(str(exc))
         planner = OllamaPlanner(
-            **model_options, client=client,
+            model=client.model, base_url=client.base_url, timeout=client.timeout,
+            temperature=client.temperature, log_path=client.log_path, client=client,
             parameter_policy=parameter_policy,
             enable_agent_registry=args.enable_agent_registry,
         )
@@ -351,13 +376,9 @@ def build_orchestrator(
         planner=planner,
         knowledge=knowledge,
         device_manager=device_manager,
-        usrp=usrp,
+        usrp=usrp, ris=executor.ris,
         max_retries=args.max_retries,
         max_replans=args.max_replans,
-    )
-    executor = WorkflowExecutor(
-        knowledge=knowledge, device_manager=device_manager, usrp=usrp,
-        max_retries=args.max_retries,
     )
     runtime = RequestRouter(
         intent_agent=intent_agent, executor=executor, orchestrator=orchestrator,
@@ -418,6 +439,8 @@ def main() -> int:
     print(describe_plan(tasks, planner_name, heading=heading))
     if fake_outcome is None:
         print("\n执行结果（当前后端为远程智能体）：")
+    elif args.network_chat_url:
+        print("\n执行结果（网络监管智能体使用真实 HTTP 接口）：")
     elif args.knowledge_api_url:
         print("\n执行结果（知识智能体使用真实 HTTP 接口，其余后端为 Fake）：")
     else:

@@ -50,11 +50,35 @@
         }
       }
     },
+    "interfaces": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/interface" }
+    },
     "constraints": {
       "$ref": "#/$defs/stringList"
     }
   },
   "$defs": {
+    "interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "url", "description"],
+      "properties": {
+        "protocol": { "enum": ["http", "sse", "tcp"] },
+        "url": { "type": "string", "format": "uri", "pattern": "^[^\\s#]+$" },
+        "description": { "type": "string", "minLength": 1 },
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+        "verification": { "enum": ["configured", "verified"] }
+      },
+      "if": { "properties": { "protocol": { "const": "tcp" } } },
+      "then": {
+        "properties": { "url": { "pattern": "^tcp://[^/?#@]+:[0-9]+$" }, "method": false }
+      },
+      "else": {
+        "required": ["method"],
+        "properties": { "url": { "pattern": "^https?://[^/?#@]+(?:[/?][^#]*)?$" } }
+      }
+    },
     "stringList": {
       "type": "array",
       "items": {

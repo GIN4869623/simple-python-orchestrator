@@ -8,6 +8,8 @@ def _build_fixed_tasks(
     *,
     require_device_query: bool = False,
 ) -> list[Task]:
+    if intent.target_type == "ris":
+        return [build_direct_task(intent.evidence, intent)]
     if intent.intent_type is IntentType.KNOWLEDGE_QUERY:
         return [
             Task(
@@ -21,6 +23,10 @@ def _build_fixed_tasks(
             )
         ]
     if intent.intent_type is IntentType.DEVICE_QUERY:
+        if intent.target_type == "environment_sensor":
+            task = build_direct_task(intent.evidence, intent)
+            if task is not None:
+                return [task]
         capability = intent.required_capabilities[0]
         return [
             Task(
@@ -95,6 +101,10 @@ def _build_fixed_tasks(
 def build_direct_task(user_request: str, intent: IntentAnalysis) -> Task | None:
     """Bind a complete single-agent request to an explicit local handler."""
     capabilities = set(intent.required_capabilities)
+    if intent.target_type == "ris" and capabilities <= {"ris.chat", "knowledge.explain", "device.list", "device.inspect"}:
+        return Task("ris_reply", "ris", user_request, capability=next(iter(capabilities), "ris.chat"),
+                    inputs={"request": user_request}, expected_output=["answer"],
+                    completion_criteria=["收到 RIS 智能体的完整文字回复"])
     if (
         intent.intent_type is IntentType.KNOWLEDGE_QUERY
         and intent.execution_mode is ExecutionMode.INFORMATIONAL
@@ -113,12 +123,13 @@ def build_direct_task(user_request: str, intent: IntentAnalysis) -> Task | None:
         and len(capabilities) == 1
         and capabilities <= {"device.list", "device.inspect"}
     ):
+        sensor_reading = intent.target_type == "environment_sensor"
         return Task(
             "query_devices", "device_manager", user_request,
             capability=next(iter(capabilities)),
-            inputs={**intent.provided_parameters, "target_type": intent.target_type},
-            expected_output=["network_devices"],
-            completion_criteria=["返回匹配设备及其当前状态"],
+            inputs=intent.provided_parameters if sensor_reading else {**intent.provided_parameters, "target_type": intent.target_type},
+            expected_output=["answer"] if sensor_reading else ["network_devices"],
+            completion_criteria=["返回指定地点和指标的读数"] if sensor_reading else ["返回匹配设备及其当前状态"],
         )
     return None
 
@@ -127,6 +138,8 @@ def build_predefined_workflow(
     intent: IntentAnalysis, *, require_device_query: bool = False,
 ) -> list[Task] | None:
     """Only the existing single-operation USRP workflow is predefined today."""
+    if intent.target_type == "ris":
+        return [build_direct_task(intent.evidence, intent)]
     capabilities = set(intent.required_capabilities) - {"device.list"}
     if (
         intent.intent_type is IntentType.HARDWARE_EXECUTION

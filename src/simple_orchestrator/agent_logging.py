@@ -15,7 +15,7 @@ from .models import AgentResult
 
 
 _WRITE_LOCK = Lock()
-_LOGGED_AGENTS = {"knowledge", "device_manager"}
+_LOGGED_AGENTS = {"knowledge", "device_manager", "ris"}
 
 
 @dataclass(frozen=True)

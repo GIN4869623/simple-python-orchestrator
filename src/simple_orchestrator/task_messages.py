@@ -16,7 +16,7 @@ _LABELS = {
     "center_frequency_hz": "中心频率（Hz）", "sample_rate_sps": "采样率（Sps）",
     "gain_db": "增益（dB）", "skill_id": "操作指导编号", "version": "版本",
     "sha256": "SHA-256 摘要", "knowledge": "知识说明", "assumptions": "假设条件",
-    "recommendations": "建议", "network_devices": "设备清单",
+    "recommendations": "建议", "network_devices": "设备清单", "answer": "查询结果",
     "selected_device": "选定设备", "device_candidates_from": "设备查询结果来源",
     "usrp.transmit": "USRP 信号发射", "usrp.receive": "USRP 信号接收",
     "usrp.configure": "USRP 参数配置", "usrp.stop": "停止 USRP 操作",
@@ -76,12 +76,12 @@ def make_knowledge_request(
     return {"message": " ".join(parts)}
 
 
-def make_agent_request(context: Mapping[str, Any]) -> dict[str, str]:
+def make_agent_request(context: Mapping[str, Any], *, include_user_request: bool = True) -> dict[str, str]:
     """Only this one-field object crosses the business agent boundary."""
     task = context["current_task"]
     sentences = [f"请完成以下任务：{task.get('description', '')}"]
     user_request = context.get("user_request")
-    if user_request and user_request != task.get("description"):
+    if include_user_request and user_request and user_request != task.get("description"):
         sentences.append(f"用户的需求是：{user_request}")
     capability = task.get("capability")
     if capability == "knowledge.lookup_skill":

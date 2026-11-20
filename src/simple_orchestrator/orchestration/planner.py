@@ -119,15 +119,17 @@ PLANNER_INSTRUCTIONS = """你是多智能体任务规划器。上游已经完成
 3. description 必须描述本任务的具体对象、动作和边界。
 4. inputs 必须写出执行所需输入；来自前置任务的数据使用“任务ID.字段名”表示。
 5. expected_output 和 completion_criteria 必须具体、可检查。
-6. device_query 只安排一个 device_manager 任务，不安排 knowledge 或 usrp。
+6. RIS 任务使用 ris 智能体，文字问答用 knowledge.explain，其余专业任务用 ris.chat。RIS 返回 answer 文字，主编排器不编造 RIS 内部步骤。
+   非 RIS 的 device_query 只安排一个 device_manager 任务，不安排 knowledge 或 usrp。
+   查询实时传感器读数时，device_manager 使用 device.inspect，描述保留地点和指标，expected_output 使用 answer。
    USRP 专属知识请求可以安排 usrp 的 knowledge.explain 只读任务，不得安排物理操作。
    真实 USRP 物理操作交给 usrp；主图会补齐所需前置任务。
-7. knowledge 不得查询实时设备；device_manager 只负责查询设备清单和状态，不得选择、占用或使用设备，也不得审批法规；usrp 不得执行 RIS、软件仿真或通用硬件任务。
+7. knowledge 不得查询实时设备；device_manager 只负责查询设备清单、状态和传感器读数，不得选择、占用或使用设备，也不得审批法规；usrp 不得执行 RIS、软件仿真或通用硬件任务。
 8. 计划必须覆盖 intent_analysis.required_capabilities 中的全部能力。
 9. 当 provided_parameters.parameter_policy 为 use_backend_defaults 时，将 unresolved_parameters 原样传给硬件任务，由 Fake 或后端补全；不得自行编造参数。
 10. task_id 必须唯一，依赖只能引用更早出现的任务。
 11. 仅当 agent_registry_enabled=true 时，available_agents 才包含需要严格遵守的能力仓库资料和前置条件；为 false 时不要自行添加仓库约束。
-12. 网络监管返回 network_devices 设备清单。启用能力仓库时，USRP 物理任务必须依赖设备查询任务，并在 inputs.device_candidates_from 中引用“查询任务ID.network_devices”；目标设备由编排器确定。
+12. 设备清单查询要求网络监管返回 network_devices。启用能力仓库时，USRP 物理任务必须依赖设备查询任务，并在 inputs.device_candidates_from 中引用“查询任务ID.network_devices”；目标设备由编排器确定。
 13. 不输出解释，只返回符合 JSON Schema 的计划。
 14. knowledge 任务可在 inputs.question 中提供一句简短、可独立理解的子问题，保留用户明确要求的回答长度和格式。不要把预期输出或验收标准重复写入问题。
 """
@@ -288,14 +290,14 @@ class OllamaPlanner(OllamaClient):
         if (
             intent.intent_type is IntentType.HARDWARE_EXECUTION
             and (
-                intent.target_type != "usrp"
-                or "usrp" not in user_request.lower()
+                intent.target_type not in {"usrp", "ris"}
+                or (intent.target_type not in user_request.lower() and not (intent.target_type == "ris" and "反射面" in user_request))
             )
         ):
             return TaskPlan(
                 PlanStatus.UNSUPPORTED,
                 intent,
-                reason="真实硬件执行必须由用户明确指定 USRP",
+                reason="真实硬件执行必须由用户明确指定 USRP 或 RIS",
             )
 
         intent = _apply_registry_device_policy(intent, self.enable_agent_registry)
@@ -321,9 +323,9 @@ class OllamaPlanner(OllamaClient):
                 profile.as_prompt_dict() for profile in candidates
             ]
         elif intent.intent_type is IntentType.DEVICE_QUERY:
-            available_agents = ["device_manager"]
+            available_agents = ["ris"] if intent.target_type == "ris" else ["device_manager"]
         else:
-            available_agents = ["knowledge", "device_manager", "usrp"]
+            available_agents = ["knowledge", "device_manager", "usrp"] + (["ris"] if intent.target_type == "ris" else [])
 
         planning_context = {
             "original_request": user_request,
@@ -370,7 +372,7 @@ class OllamaPlanner(OllamaClient):
                 profile.as_prompt_dict() for profile in candidates
             ]
         else:
-            available_agents = ["knowledge", "device_manager", "usrp"]
+            available_agents = ["knowledge", "device_manager", "usrp"] + (["ris"] if state.intent and state.intent.target_type == "ris" else [])
         review_context = {
             "user_request": state.user_request,
             "intent_analysis": _intent_to_dict(state.intent),
@@ -656,7 +658,7 @@ def _parse_tasks(
 def _ensure_hardware_device_query(intent: IntentAnalysis) -> IntentAnalysis:
     """Require a read-only device query before hardware execution."""
 
-    if intent.intent_type is not IntentType.HARDWARE_EXECUTION:
+    if intent.intent_type is not IntentType.HARDWARE_EXECUTION or intent.target_type == "ris":
         return intent
     capabilities = [
         capability

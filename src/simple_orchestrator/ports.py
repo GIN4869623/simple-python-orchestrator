@@ -34,6 +34,14 @@ class IntentAgentPort(Protocol):
         """Understand one request and suggest a handling mode; never execute it."""
 
 
+class OrchestrationPort(Protocol):
+    def run(
+        self, user_request: str, *, request_id: str | None = None,
+        intent: IntentAnalysis | None = None,
+    ) -> dict[str, Any]:
+        """Plan and execute a complex request using an upstream intent."""
+
+
 class GraphPlannerPort(Protocol):
     """Dynamic planning and review, independent of intent recognition."""
 

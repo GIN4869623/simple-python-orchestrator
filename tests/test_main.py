@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from simple_orchestrator.orchestration.main import (
+    build_executor,
     build_parser,
     choose_fake_outcome,
     describe_intent,
@@ -35,6 +36,16 @@ class MainOutputTests(unittest.TestCase):
         })
         environment.start()
         self.addCleanup(environment.stop)
+
+    def test_executor_keeps_the_actual_knowledge_sender(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "--knowledge-api-url", "http://knowledge/answer", "--fake-outcome", "succeeded",
+        ])
+        orchestrator, _ = build_executor(args, parser)
+        intent, _ = build_executor(args, parser, knowledge_sender="意图识别智能体")
+        self.assertEqual("编排智能体", orchestrator.knowledge.sender)
+        self.assertEqual("意图识别智能体", intent.knowledge.sender)
 
     @patch("simple_orchestrator.knowledge_http.urlopen")
     def test_real_knowledge_can_run_without_other_remote_agents(self, urlopen) -> None:

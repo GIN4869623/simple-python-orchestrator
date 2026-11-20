@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from langgraph.graph import START
 
@@ -24,21 +24,30 @@ class GraphOrchestrator(WorkflowExecutor):
         knowledge: KnowledgeAgentPort, device_manager: DeviceManagerPort,
         usrp: UsrpAgentPort, max_retries: int = 1, max_replans: int = 1,
         allow_remote_physical_execution: bool = False,
+        ris=None,
     ) -> None:
         self.planner = planner
         super().__init__(
             knowledge, device_manager, usrp, max_retries, max_replans,
-            allow_remote_physical_execution,
+            allow_remote_physical_execution, ris=ris,
         )
 
     def run(
         self, user_request: str, *, request_id: str | None = None,
         intent: IntentAnalysis | None = None,
+        on_progress: Callable[[MainState], None] | None = None,
     ) -> MainState:
         initial = self.initial_state(user_request, request_id)
         if intent is not None:
             initial["intent"] = intent
-        return self.graph.invoke(initial, {"recursion_limit": 100})
+        config = {"recursion_limit": 100}
+        if on_progress is None:
+            return self.graph.invoke(initial, config)
+        state = initial
+        for state in self.graph.stream(initial, config, stream_mode="values"):
+            if state["status"] is WorkflowStatus.RUNNING:
+                on_progress(state)
+        return state
 
     def _build_graph(self):
         graph = self._execution_graph()

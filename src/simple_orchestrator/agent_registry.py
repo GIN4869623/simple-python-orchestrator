@@ -82,7 +82,7 @@ def build_default_registry() -> AgentRegistry:
             AgentProfile(
                 agent_id="device_manager",
                 name="网络监管智能体",
-                description="只读查询网络中的设备清单和在线状态。",
+                description="只读查询网络中的设备清单、在线状态及实时传感器读数。",
                 capabilities=(
                     "device.list",
                     "device.inspect",
@@ -91,7 +91,15 @@ def build_default_registry() -> AgentRegistry:
                 supported_targets=("*",),
                 side_effect_level="none",
                 exclusions=("法规审批", "通信原理回答", "设备选择或占用", "真实硬件操作"),
-                output_contract=("network_devices",),
+                output_contract=("network_devices", "answer"),
+            ),
+            AgentProfile(
+                agent_id="ris", name="RIS 智能体",
+                description="接收 RIS 自然语言任务并返回完整文字回复。",
+                capabilities=("ris.chat", "knowledge.explain", "device.list", "device.inspect"),
+                supported_intents=("knowledge_query", "device_query", "hardware_execution"),
+                supported_targets=("ris",), side_effect_level="remote_agent",
+                output_contract=("answer",),
             ),
             AgentProfile(
                 agent_id="usrp",

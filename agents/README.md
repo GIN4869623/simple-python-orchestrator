@@ -12,4 +12,4 @@
 文件路径、源码指纹、接口定义和内部 Skill 匹配规则不进入能力摘要。
 
 `usrp.json` 根据 Agent_SDR 代码整理；`schema.json` 用于格式校验，无需放入 LLM 提示词。
-当前规划器尚未加载这些 JSON。
+

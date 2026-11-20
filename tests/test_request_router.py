@@ -310,6 +310,19 @@ class IntentAgentTests(unittest.TestCase):
             with self.assertRaises(PlanningError):
                 OllamaIntentAgent(client).analyze_intent("解释 QPSK")
 
+    def test_knowledge_intent_uses_read_only_capability_and_explicit_usrp_target(self):
+        for message, target in (("解释 QPSK", None), ("动态拆解 USRP 知识问题", "usrp")):
+            with self.subTest(message=message):
+                client = OllamaClient("test-model")
+                data = asdict(FixedIntentAgent().analyze_intent(message))
+                data.update(required_capabilities=["knowledge_query"], target_type=None, execution_mode="physical")
+                with patch.object(client, "_chat", return_value={"message": {"content": json.dumps(data)}}):
+                    intent = OllamaIntentAgent(client).analyze_intent(message)
+                self.assertEqual(["knowledge.explain"], intent.required_capabilities)
+                self.assertEqual(target, intent.target_type)
+                self.assertEqual("informational", intent.execution_mode)
+                self.assertEqual(data["handling_mode"], intent.handling_mode)
+
     def test_demo_defaults_are_applied_before_routing(self):
         intent = FixedIntentAgent(ParameterPolicy.DEMO_DEFAULTS).analyze_intent("使用 USRP 发射信号")
         self.assertIs(HandlingMode.FIXED_WORKFLOW, intent.handling_mode)

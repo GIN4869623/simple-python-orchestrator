@@ -5,19 +5,29 @@
 
 ## 请求处理方式
 
-编排服务保留前端入口，调用意图服务识别请求后，再选择处理路径：
+意图服务是网页业务请求的统一入口，识别一次后按实际处理路径调用：
 
 ```text
-用户请求 → 编排服务入口（18002）
-             ├─ HTTP 调用意图识别服务（18003）→ 返回结构化意图
-             └─ 根据意图分流
-                  ├─ 明确单一任务 → 直接调用业务智能体
-                  ├─ 已有标准步骤 → 固定业务流程
-                  └─ 需要动态拆解 → 动态规划、调度与复盘
+用户请求 → 意图识别与分流服务（18003）
+             ├─ 明确单一任务 → 直接调用对应业务智能体
+             ├─ 已有标准步骤 → 执行固定业务流程
+             └─ 需要动态拆解 → HTTP 请求编排服务（18002）
+                                   → 动态规划、调用业务智能体、复盘
 ```
 
-信息不足时先返回澄清问题。直接调用和固定流程跳过模型规划与复盘；
-Agent Registry 保留后续接入点，默认关闭。
+信息不足时先返回澄清问题，不调用业务智能体。直接调用和固定流程不请求编排服务。
+转交动态编排时携带已经识别的意图和同一个请求编号，编排服务不重复识别意图。
+实际业务适配器仍由原有配置决定；网络监管和 USRP 未接真实接口时继续使用 Fake。
+
+正式请求入口为 `POST /api/intent/runs`，正文为 `{"request":"任务文本"}`，
+立即返回 HTTP 202 与请求编号；通过 `GET /api/intent/runs/<request_id>` 查询识别、
+分流、执行阶段、实际调用目标和完整结果。动态任务的 `orchestration_request_id`
+可用于查询编排服务的同一请求。服务各保留最近 20 条记录，不自动重试业务请求。
+
+`POST /api/intent/analyze` 保留为纯识别调试接口，不执行任务。
+`POST /api/orchestrator/dispatch` 是服务间动态转交接口，需要 Bearer 认证和已就绪的
+`orchestrated` 意图；不允许重复请求编号、缺失参数、演示默认参数或未明确指定的硬件执行。
+原有 `/api/orchestrator/run(s)` 和 CLI 保留兼容，网页正常入口不经过该兼容调用链。
 
 ## 文件夹说明
 
@@ -42,10 +52,10 @@ Agent Registry 保留后续接入点，默认关闭。
 
 ```text
 orchestration/main.py（CLI） / orchestration/api.py（HTTP）
-    → orchestration/router.py（请求分流）
-        → intent/client.py → HTTP → intent/service.py → intent/agent.py
-        → orchestration/workflows.py → orchestration/execution.py（直接 / 固定流程）
-        → orchestration/graph.py → orchestration/planner.py（动态编排）
+    → intent/service.py → intent/agent.py（识别一次）
+        → orchestration/router.py → workflows.py → execution.py（直接 / 固定流程）
+        → orchestration/client.py → HTTP → orchestration/api.py
+            → orchestration/graph.py → orchestration/planner.py（动态编排）
 ```
 
 ## 启动两个服务
@@ -61,7 +71,7 @@ orchestration/main.py（CLI） / orchestration/api.py（HTTP）
 ```bash
 cd /home/wenchaoxia/Desktop/simple-python-orchestrator
 source .venv/bin/activate
-./serve-intent --host 192.168.1.106 --port 18003
+./serve-intent --host 192.168.1.106 --port 18003 --orchestration-service-url http://192.168.1.106:18002
 ```
 
 看到“意图识别服务：http://192.168.1.106:18003”后，保持该终端运行，再启动编排服务。
@@ -77,8 +87,8 @@ source .venv/bin/activate
 看到“编排 HTTP 服务”启动信息后，即可从前端提交任务。
 本机当前局域网 IP 为 `192.168.1.106`，两个服务只绑定该网卡地址：
 
-- 编排服务：`http://192.168.1.106:18002`，前端继续使用 `/api/orchestrator/*` 接口。
-- 意图识别服务：`http://192.168.1.106:18003`，提供 `/api/intent/analyze`。
+- 编排服务：`http://192.168.1.106:18002`，接收意图服务转交的动态任务，前端用于跟踪这些任务。
+- 意图识别与分流服务：`http://192.168.1.106:18003`，网页通过 `/api/intent/runs` 提交任务。
 
 局域网内的外部程序使用上述地址访问，接口仍需要 Bearer 认证。
 网络或机器变化后，用服务器的新 IP 替换启动命令和配置中的地址。
@@ -97,10 +107,12 @@ ORCHESTRATOR_API_PORT=18002
 INTENT_API_HOST=192.168.1.106
 INTENT_API_PORT=18003
 INTENT_SERVICE_URL=http://192.168.1.106:18003
+ORCHESTRATION_SERVICE_URL=http://192.168.1.106:18002
 ```
 
-`INTENT_SERVICE_URL` 是编排服务调用意图服务的地址，也需与意图服务的实际监听地址一致。
-跨机器部署时，将其设为意图服务所在服务器的可访问地址。
+`ORCHESTRATION_SERVICE_URL` 是意图服务转交动态任务的地址。
+`INTENT_SERVICE_URL` 保留给编排器兼容入口和 CLI 的纯意图分析调用。
+  跨机器部署时，将其设为意图服务所在服务器的可访问地址。
 两端意图接口密钥需要一致；未单独设置 `INTENT_API_TOKEN` 时复用 `ORCHESTRATOR_API_TOKEN`。
 
 ## 不调用模型的双服务联调
@@ -146,3 +158,13 @@ CLI 在当前进程执行编排，并通过 HTTP 调用意图服务：
 ```bash
 deactivate
 ```
+
+## RIS 文字回复
+
+意图服务与编排服务可通过 `RIS_AGENT_CHAT_URL` 调用 RIS 的 `/api/chat/stream`，
+使用现有 `think` 模式接收 SSE，最终以 `done.reply` 作为完整答案。
+每个任务使用独立的 `session_id`，`runId` 对应请求、任务和尝试编号。
+回复保存在任务结果的 `data.answer` 中，直接显示在意图识别或编排跟踪面板；
+Agent 业务服务层维持原有任务展示。这里的“回复已收到”仅表示收到了文字，
+不将一段回复当作硬件动作成功的独立证明。流中断且没有最终回复时记录为结果未知，
+不自动重新提交 RIS 任务。`RIS_AGENT_TIMEOUT` 默认 180 秒；空的接口地址禁用 RIS。

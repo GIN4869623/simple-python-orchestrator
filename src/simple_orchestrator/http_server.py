@@ -40,6 +40,44 @@ class JsonRequestHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.UNAUTHORIZED, {"detail": self.authentication_error})
         return False
 
+    def _model_get(self) -> None:
+        settings = getattr(self.server, "model_settings", None)
+        if settings is None:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"detail": "当前服务未启用模型切换"})
+            return
+        self._json(HTTPStatus.OK, settings.snapshot())
+
+    def _model_post(self, locks: list) -> None:
+        from .errors import PlanningError
+        settings = getattr(self.server, "model_settings", None)
+        if settings is None:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"detail": "当前服务未启用模型切换"})
+            return
+        payload = self._read_json()
+        if payload is None:
+            return
+        if set(payload) != {"provider"} or not isinstance(payload["provider"], str):
+            self._json(HTTPStatus.BAD_REQUEST, {"detail": "只接受 provider 模型提供方"})
+            return
+        acquired = []
+        try:
+            for lock in locks:
+                if not lock.acquire(blocking=False):
+                    self._json(HTTPStatus.CONFLICT, {"detail": "服务正在处理任务，请完成后再切换模型"})
+                    return
+                acquired.append(lock)
+            try:
+                data = settings.select(payload["provider"])
+            except PlanningError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"detail": str(exc)})
+                return
+            self.server.runtime_info.update(model_provider=data["provider"], model=data["model"])
+            self.server.runtime_info["backend" if settings.purpose == "intent" else "planner"] = data["provider"]
+            self._json(HTTPStatus.OK, data)
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
     def _read_json(self) -> dict[str, Any] | None:
         if self.headers.get_content_type() != "application/json":
             self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"detail": "请使用 application/json"})

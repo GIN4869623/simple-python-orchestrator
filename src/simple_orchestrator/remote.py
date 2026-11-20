@@ -191,3 +191,83 @@ class JsonRpcAgentAdapter:
             data,
             str(result["error"]) if result.get("error") is not None else None,
         )
+
+
+def call_ris_chat(context: Mapping[str, Any], *, endpoint: str, timeout: float = 180.0,
+                  message_log: AgentMessageLog | None = None) -> AgentResult:
+    """Consume the RIS chat stream and return its final text to the caller."""
+    import time
+    from urllib.parse import urlsplit
+
+    if urlsplit(endpoint).scheme not in {"http", "https"} or timeout <= 0:
+        raise ValueError("RIS 接口地址或超时配置无效")
+    metadata = invocation_metadata(context)
+    instruction = (context.get("user_request", "") if context.get("single_task")
+                   else make_agent_request(context)["message"])
+    payload = {
+        "instruction": instruction,
+        "session_id": f"orchestrator-{metadata['request_id']}-{metadata['task_id']}",
+        "runId": metadata["attempt_id"], "task": context["current_task"]["description"],
+        "mode": "think",
+    }
+    log_metadata = {**metadata, "endpoint": endpoint, "transport": "sse"}
+    def log(event: str, **values: Any) -> None:
+        if message_log:
+            message_log.record("ris", event, log_metadata, **values)
+    log("request", payload=payload)
+    received = 0
+    deadline = time.monotonic() + timeout
+    data_lines: list[str] = []
+    def consume() -> AgentResult | None:
+        if not data_lines:
+            return None
+        event = json.loads("\n".join(data_lines))
+        data_lines.clear()
+        if not isinstance(event, dict):
+            raise RemoteCallError("RIS 流式事件必须为对象")
+        log("response", payload=event)
+        if event.get("type") == "error":
+            return AgentResult(ResultStatus.FAILED,
+                str(event.get("message") or event.get("content") or event.get("error") or "RIS 返回错误"),
+                error="ris_error")
+        if event.get("type") != "done":
+            return None
+        reply = event.get("reply")
+        if not isinstance(reply, str) or not reply.strip():
+            raise RemoteCallError("RIS 最终回复缺少文字内容")
+        return AgentResult(ResultStatus.SUCCEEDED, reply, {
+            "answer": reply, "response_received": True,
+            "run_id": payload["runId"], "session_id": payload["session_id"],
+            "tools_total": event.get("tools_total"), "timing": event.get("timing", {}),
+            "completion_kind": "text_reply",
+        })
+    request = Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                      headers={"Content-Type": "application/json", "Accept": "text/event-stream"}, method="POST")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if response.headers.get_content_type() != "text/event-stream":
+                raise RemoteCallError("RIS 未返回 SSE 流式响应")
+            while True:
+                line = response.readline(1024 * 1024 + 1)
+                if not line:
+                    result = consume()
+                    if result:
+                        return result
+                    break
+                received += len(line)
+                if received > 4 * 1024 * 1024 or len(line) > 1024 * 1024:
+                    raise RemoteCallError("RIS 回复超过接收限制")
+                if time.monotonic() > deadline:
+                    raise RemoteCallError("RIS 等待最终回复超时")
+                text = line.decode("utf-8").rstrip("\r\n")
+                if not text:
+                    result = consume()
+                    if result:
+                        return result
+                elif text.startswith("data:"):
+                    data_lines.append(text[5:].removeprefix(" "))
+        raise RemoteCallError("RIS 连接已结束，但未收到最终回复")
+    except (HTTPError, URLError, OSError, UnicodeError, ValueError, RemoteCallError) as exc:
+        log("error", error=f"{type(exc).__name__}: {exc}")
+        # The task may have been accepted; never trigger an automatic duplicate.
+        return AgentResult(ResultStatus.UNKNOWN, f"RIS 回复未完整收到：{exc}", error="ris_response_unknown")

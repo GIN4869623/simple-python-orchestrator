@@ -68,23 +68,30 @@ INTENT_INSTRUCTIONS = """你是业务请求意图分析器，理解用户想做�
   由固定的 Skill 查询、设备查询和硬件执行流程完成。
 - orchestrated：需要动态拆解子任务、跨能力协调，或根据中间结果决定后续任务。
   多个问题若同一个专业智能体可以独立回答，仍可 direct；多个智能体也可以走固定流程。
+  用户明确要求动态拆解或动态编排时，应遵循该要求，使用 orchestrated。
 - 信息不足时标记 needs_clarification，不要猜测参数；澄清完成前不会执行任何路径。
 
 分类定义：
 - knowledge_query：解释、咨询、设计方案、操作指导或纯软件仿真，不产生真实设备效果。
-- device_query：查询设备清单、在线状态、能力或可用性，只读访问设备资源信息。
+- device_query：只读查询设备清单、在线状态、能力、可用性或实时传感器读数。
 - hardware_execution：用户明确要求对真实硬件执行操作。
-- unsupported：请求执行非 USRP 硬件，或当前系统能力明显无法处理。
+- unsupported：请求执行 USRP、RIS 之外的硬件，或当前系统能力明显无法处理。
 
 识别规则：
 1. “如何使用 USRP”“解释 USRP”“仿真 QPSK”属于 knowledge_query，不是硬件执行。
    USRP 专属知识可由 USRP 智能体以只读方式回答，但不能因此执行硬件操作。
+   知识问答的 required_capabilities 固定为 ["knowledge.explain"]，USRP 专属知识的 target_type 为 usrp。
+   RIS 专属问答或明确交给 RIS 智能体的文字请求，target_type 为 ris，由 RIS 回答。
    通用通信知识仍可交给 Knowledge。
    查询可用 USRP 设备、设备清单或在线状态属于 device_query，能力使用
    device.list 或 device.inspect，不要使用 usrp.get_status。
+   “查询实验室1光照强度”等实时光照、温度、湿度读数属于网络监管查询：
+   intent_type=device_query，domain=network_monitoring，target_type=environment_sensor，
+   action=inspect，execution_mode=read_only，required_capabilities=["device.inspect"]。
+   保留用户提供的地点和指标，简单查询使用 direct。
 2. 只有用户明确要求真实配置、发射、接收、停止等操作时，execution_mode 才能是 physical。
 3. USRP 真实操作的 target_type 必须是 usrp。
-4. RIS、频谱仪、信号源和其他非 USRP 硬件的真实操作属于 unsupported。
+4. 明确交给 RIS 的任务 target_type 为 ris，能力为 ris.chat；简单任务 direct，需要动态拆解时 orchestrated。RIS 自行处理专业业务，上游只接收文字回复，不编造其操作参数。频谱仪、信号源等未接入的硬件属于 unsupported。
 5. USRP 执行能力只能是 usrp.configure、usrp.transmit、usrp.receive、usrp.stop 或 usrp.get_status。
 6. USRP 硬件执行只要求相应的 usrp 能力；不要自动加入设备查询任务。
 7. 发射操作至少需要 waveform、center_frequency_hz、sample_rate_sps、gain_db、duration_seconds。缺少时写入 missing_parameters，并令 needs_clarification=true。
@@ -104,7 +111,7 @@ class FixedIntentAgent:
         intent = _analyze_intent_with_rules(user_request)
         mode = (
             HandlingMode.FIXED_WORKFLOW
-            if intent.intent_type is IntentType.HARDWARE_EXECUTION
+            if intent.intent_type is IntentType.HARDWARE_EXECUTION and intent.target_type != "ris"
             else HandlingMode.DIRECT
         )
         # The offline recognizer only recognizes these explicit multi-step cues.
@@ -136,10 +143,20 @@ class OllamaIntentAgent:
         )
         data = self.client._response_content_as_json(response_body, "结构化意图分析")
         intent = _parse_intent_analysis(data)
-        if intent.intent_type is IntentType.DEVICE_QUERY:
+        if intent.intent_type is IntentType.KNOWLEDGE_QUERY:
+            # Knowledge requests always use the read-only business capability.
+            intent = replace(
+                intent,
+                execution_mode=ExecutionMode.INFORMATIONAL,
+                required_capabilities=["knowledge.explain"],
+                target_type=("ris" if re.search(r"(?i)(?<![a-z0-9_])ris(?![a-z0-9_])|反射面", user_request) and "usrp" not in user_request.lower()
+                             else "usrp" if "usrp" in user_request.lower() else intent.target_type),
+            )
+        elif intent.intent_type is IntentType.DEVICE_QUERY:
             capability = (
                 "device.inspect"
-                if "状态" in user_request or "inspect" in intent.action.lower()
+                if intent.target_type == "environment_sensor" or "状态" in user_request
+                or "inspect" in intent.action.lower() or "device.inspect" in intent.required_capabilities
                 else "device.list"
             )
             intent = replace(
@@ -201,7 +218,7 @@ def _analyze_intent_with_rules(user_request: str) -> IntentAnalysis:
     request = user_request.strip()
     lowered = request.lower()
     is_usrp = "usrp" in lowered
-    is_ris = "ris" in lowered
+    is_ris = bool(re.search(r"(?i)(?<![a-z0-9_])ris(?![a-z0-9_])|反射面", request))
     asks_how = any(
         marker in lowered
         for marker in ("如何", "怎么", "解释", "介绍", "原理", "什么是", "仿真", "模拟")
@@ -213,16 +230,25 @@ def _analyze_intent_with_rules(user_request: str) -> IntentAnalysis:
     asks_devices = ("设备" in request or is_usrp) and any(
         marker in request for marker in ("查询", "哪些", "列表", "状态", "在线", "可用", "能力")
     )
+    asks_sensor_reading = not (asks_how or has_execution_verb) and (
+        any(marker in request for marker in ("查询", "查看", "读取", "当前", "实时", "读数", "多少"))
+        and any(metric in request for metric in ("光照", "温度", "湿度", "温湿度"))
+    )
 
-    if is_ris and has_execution_verb and not asks_how:
+    if is_ris and not is_usrp:
+        physical = has_execution_verb and not asks_how
         return IntentAnalysis(
-            IntentType.UNSUPPORTED,
-            "wireless_communication",
-            "ris",
-            "execute",
-            ExecutionMode.PHYSICAL,
-            evidence=request,
-            reason="当前系统没有 RIS 硬件执行智能体",
+            IntentType.HARDWARE_EXECUTION if physical else IntentType.KNOWLEDGE_QUERY,
+            "wireless_communication", "ris", "delegate" if physical else "explain",
+            ExecutionMode.PHYSICAL if physical else ExecutionMode.INFORMATIONAL,
+            required_capabilities=["ris.chat" if physical else "knowledge.explain"],
+            evidence=request, reason="将明确的 RIS 请求交给 RIS 智能体并接收文字回复",
+        )
+    if asks_sensor_reading:
+        return IntentAnalysis(
+            IntentType.DEVICE_QUERY, "network_monitoring", "environment_sensor", "inspect",
+            ExecutionMode.READ_ONLY, required_capabilities=["device.inspect"],
+            evidence=request, reason="查询实时传感器读数",
         )
     if asks_devices:
         capability = "device.inspect" if "状态" in request else "device.list"
